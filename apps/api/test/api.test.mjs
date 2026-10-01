@@ -23,11 +23,23 @@ process.env.JWT_SECRET = 'test-secret-'.padEnd(48, 'x');
 process.env.DEFAULT_ADMIN_PASSWORD = 'Test-Admin#123';
 process.env.PORT = String(API_PORT);
 
-// mock 上游：标准 OpenAI 兼容 SSE
+// mock 上游：标准 OpenAI 兼容 SSE + 简化 embeddings（含"猫"→[1,0]，否则[0,1]）
 const mockServer = http.createServer((req, res) => {
   let raw = '';
   req.on('data', (c) => (raw += c));
   req.on('end', () => {
+    if (req.url.endsWith('/embeddings') && req.method === 'POST') {
+      let parsed = {};
+      try { parsed = JSON.parse(raw); } catch {}
+      const inputs = Array.isArray(parsed.input) ? parsed.input : [String(parsed.input || '')];
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        model: parsed.model || 'mock-embedding',
+        data: inputs.map((text, index) => ({ index, embedding: String(text).includes('猫') ? [1, 0] : [0, 1], object: 'embedding' })),
+        usage: { prompt_tokens: 1, total_tokens: 1 },
+      }));
+      return;
+    }
     if (!req.url.endsWith('/chat/completions')) {
       res.writeHead(404);
       return res.end();
@@ -44,6 +56,9 @@ await new Promise((r) => mockServer.listen(MOCK_PORT, '127.0.0.1', r));
 
 process.env.DEEPSEEK_BASE_URL = `http://127.0.0.1:${MOCK_PORT}`;
 process.env.DEEPSEEK_API_KEY = 'mock-key';
+// OPENAI 同样指向 mock：语义检索（embeddings）走本地假上游
+process.env.OPENAI_BASE_URL = `http://127.0.0.1:${MOCK_PORT}`;
+process.env.OPENAI_API_KEY = 'mock-key';
 
 const apiModule = await import('../src/index.js');
 
@@ -196,6 +211,81 @@ test('下载：他人文件一律 404，无 token 401', async () => {
 test('旧的无鉴权 /uploads 路径已不存在', async () => {
   const r = await api('GET', '/uploads/anything.txt');
   assert.ok(r.status === 404 || r.status === 401, `不应可访问：${r.status}`);
+});
+
+// ---------- 语义检索（向量落库 + 混合召回） ----------
+const waitFor = async (fn, ms = 8000) => {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    if (await fn()) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+};
+
+let catFileId;
+let dogFileId;
+
+test('上传后分块自动生成向量并落库', async () => {
+  const { default: db } = await import('../src/db.js');
+  const mp = multipart([
+    { name: 'kb-cat.txt', type: 'text/plain', data: '猫喜欢在窗台上晒太阳，打呼噜的声音很治愈。' },
+    { name: 'kb-dog.txt', type: 'text/plain', data: '狗每天早晨都要出门跑步，精力非常旺盛。' },
+  ]);
+  const r = await api('POST', '/api/files', { token: tokenA, body: mp.body, headers: mp.headers });
+  assert.equal(r.status, 201);
+  catFileId = r.json.find((f) => f.name === 'kb-cat.txt').id;
+  dogFileId = r.json.find((f) => f.name === 'kb-dog.txt').id;
+
+  const ok = await waitFor(async () => {
+    const withVec = db.prepare('SELECT COUNT(*) n FROM kb_chunks WHERE file_id IN (?, ?) AND vec IS NOT NULL').get(catFileId, dogFileId).n;
+    return withVec >= 2;
+  });
+  assert.ok(ok, 'chunk 应已写入向量');
+  const dim = db.prepare('SELECT vec_dim d FROM kb_chunks WHERE vec IS NOT NULL LIMIT 1').get().d;
+  assert.equal(dim, 2, 'mock 向量维度应为 2');
+});
+
+test('检索走混合模式：语义召回关键词命不中的表述', async () => {
+  const { retrieveChunks } = await import('../src/kb.js');
+  const uid = await userIdOf(tokenA);
+  // 单字查询「猫」无法产生关键词 bigram，命中只能来自语义分支
+  const hits = await retrieveChunks(uid, '猫', [catFileId, dogFileId], 5);
+  assert.ok(hits.length >= 1, '语义检索应召回');
+  assert.equal(hits[0].via, 'hybrid');
+  assert.equal(hits[0].fileName, 'kb-cat.txt');
+});
+
+async function userIdOf(token) {
+  const r = await api('GET', '/api/auth/me', { token });
+  return r.json.user.id;
+}
+
+test('对话链路的 kb 引用标注为混合检索', async () => {
+  await api('PUT', '/api/settings', { token: tokenA, body: { kbIds: [catFileId, dogFileId] } });
+  const res = await fetch(`${BASE}/api/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
+    body: JSON.stringify({ chatId, requestId: 'req-kb-0001', model: 'deepseek-chat', messages: [{ role: 'user', content: '猫' }] }),
+  });
+  const sse = await res.text();
+  assert.match(sse, /"type":"kb"/);
+  assert.match(sse, /"via":"hybrid"/);
+  assert.match(sse, /kb-cat\.txt/);
+});
+
+test('未配置嵌入服务时回退关键词检索', async () => {
+  const { retrieveChunks } = await import('../src/kb.js');
+  const savedKey = process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_API_KEY; // tokenA 无个人 Key，openai 环境变量清空后语义分支不可用
+  try {
+    const uid = await userIdOf(tokenA);
+    const hits = await retrieveChunks(uid, '晒太阳 窗台', [catFileId, dogFileId], 5);
+    assert.ok(hits.length >= 1, '关键词回退应仍能召回');
+    assert.ok(hits.every((h) => h.via === 'keyword'), '回退结果必须全部为 keyword');
+  } finally {
+    if (savedKey) process.env.OPENAI_API_KEY = savedKey;
+  }
 });
 
 // ---------- 管理端 ----------

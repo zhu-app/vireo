@@ -99,6 +99,15 @@ export default function Settings({ status, refreshStatus }) {
       </section>
 
       <section className="card">
+        <h3>知识库语义检索</h3>
+        <p className="muted card-desc">
+          {status?.embedding?.configured
+            ? `已启用（${status.embedding.provider} · ${status.embedding.model}）。新上传的文档会自动生成向量，检索时按「语义 + 关键词」混合排序；此前入库的文件可到知识库页点「↻」重新解析补向量。`
+            : '未启用，知识库当前使用关键词检索。配置任意一个 OpenAI 或通义千问 API Key（本页上方）即自动启用语义检索；也可用 EMBEDDING_PROVIDER / EMBEDDING_MODEL 环境变量指定。'}
+        </p>
+      </section>
+
+      <section className="card">
         <h3>账号</h3>
         <p className="muted card-desc">邮箱：{status?.user?.email}；今日消息：{status?.quota?.used ?? 0}{status?.quota?.limit ? ` / ${status.quota.limit}` : '（无限制）'} 条</p>
       </section>

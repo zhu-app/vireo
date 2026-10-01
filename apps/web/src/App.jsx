@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { api, getToken, getUser, clearSession } from './lib/api.js';
+import { currentRoute, subscribe, navigate, chatHref } from './lib/router.js';
 import Auth from './components/Auth.jsx';
 import Home from './components/Home.jsx';
 import ChatView from './components/ChatView.jsx';
@@ -11,18 +12,26 @@ const THEME_KEY = 'vireo-theme';
 
 export default function App() {
   const [user, setUser] = useState(() => (getToken() ? getUser() : null));
-  const [view, setView] = useState('home'); // home | chat | kb | settings | admin
+  const [route, setRoute] = useState(() => currentRoute()); // { view, chatId }
   const [chats, setChats] = useState([]);
-  const [current, setCurrent] = useState(null);
+  const [chatsLoaded, setChatsLoaded] = useState(false);
   const [status, setStatus] = useState(null);
   const [pendingText, setPendingText] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [streamMessage, setStreamMessage] = useState('');
   const [theme, setTheme] = useState(() => localStorage.getItem(THEME_KEY) || 'light');
+
+  // 路由派生状态：视图与当前会话完全由 URL 决定，支持刷新 / 深链 / 前进后退
+  const { view, chatId } = route;
+  const current = view === 'chat' && chatId ? chats.find((c) => c.id === chatId) || null : null;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+
+  // 订阅路由变化（前进/后退、外部改 hash、我们自己的 navigate 都会触发）
+  useEffect(() => subscribe(setRoute), []);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -35,6 +44,7 @@ export default function App() {
     try {
       setChats(await api.chats());
     } catch {}
+    setChatsLoaded(true);
   }, []);
 
   useEffect(() => {
@@ -51,22 +61,21 @@ export default function App() {
     }
   }, [user, loadChats]);
 
+  // 登录后回到该去的路由；退出登录重置为首页
+  useEffect(() => {
+    if (!user && window.location.hash && window.location.hash !== '#/') {
+      navigate('#/', { replace: true });
+    }
+  }, [user]);
+
   useEffect(() => {
     const onLogout = () => {
       setUser(null);
-      setView('home');
-      setCurrent(null);
-    };
-    const onNavigate = (e) => {
-      setView(e.detail);
-      setSidebarOpen(false);
+      setChats([]);
+      setChatsLoaded(false);
     };
     window.addEventListener('vireo:logout', onLogout);
-    window.addEventListener('vireo:navigate', onNavigate);
-    return () => {
-      window.removeEventListener('vireo:logout', onLogout);
-      window.removeEventListener('vireo:navigate', onNavigate);
-    };
+    return () => window.removeEventListener('vireo:logout', onLogout);
   }, []);
 
   if (!user) return <Auth onAuth={(u) => setUser(u)} />;
@@ -75,45 +84,37 @@ export default function App() {
     try {
       const c = await api.createChat({ model: status?.model });
       setChats((v) => [c, ...v]);
-      setCurrent(c);
-      setView('chat');
       setPendingText(seedText);
       setSidebarOpen(false);
+      navigate(chatHref(c.id));
     } catch (e) {
-      alert(e.message);
+      setStreamMessage(e.message);
     }
   }
 
-  async function openChat(c) {
-    setCurrent(c);
-    setView('chat');
+  function openChat(c) {
     setPendingText('');
     setSidebarOpen(false);
+    navigate(chatHref(c.id));
   }
 
   async function renameChat(c) {
     const title = window.prompt('重命名会话', c.title);
     if (!title?.trim()) return;
-    const r = await api.renameChat(c.id, title.trim()).catch((e) => { alert(e.message); return null; });
-    if (r) {
-      setChats((v) => v.map((x) => (x.id === c.id ? { ...x, title: r.title } : x)));
-      if (current?.id === c.id) setCurrent((cur) => ({ ...cur, title: r.title }));
-    }
+    const r = await api.renameChat(c.id, title.trim()).catch((e) => { window.alert(e.message); return null; });
+    if (r) setChats((v) => v.map((x) => (x.id === c.id ? { ...x, title: r.title } : x)));
   }
 
   async function deleteChat(c) {
     if (!window.confirm(`删除「${c.title}」？聊天记录将一并移除。`)) return;
-    await api.deleteChat(c.id).catch((e) => alert(e.message));
+    await api.deleteChat(c.id).catch((e) => window.alert(e.message));
     setChats((v) => v.filter((x) => x.id !== c.id));
-    if (current?.id === c.id) {
-      setCurrent(null);
-      setView('home');
-    }
+    if (chatId === c.id) navigate('#/');
   }
 
   const go = (v) => {
-    setView(v);
     setSidebarOpen(false);
+    navigate(v === 'home' ? '#/' : `#/${v}`);
   };
 
   return (
@@ -145,7 +146,7 @@ export default function App() {
 
         <div className="chat-list">
           <p className="list-label">最近会话</p>
-          {chats.length === 0 && <p className="muted list-empty">还没有对话</p>}
+          {chats.length === 0 && <p className="muted list-empty">{chatsLoaded ? '还没有对话' : '加载中…'}</p>}
           {chats.map((c) => (
             <div className={`chat-item ${current?.id === c.id && view === 'chat' ? 'selected' : ''}`} key={c.id}>
               <button className="chat-open" onClick={() => openChat(c)}>
@@ -186,22 +187,30 @@ export default function App() {
       </div>
 
       <main className="main">
+        {streamMessage && <div className="page-error">{streamMessage}<button className="ghost" onClick={() => setStreamMessage('')}>×</button></div>}
         {view === 'home' && <Home userName={user.name} status={status} onPick={(t) => newChat(t)} />}
-        {view === 'chat' && current && (
-          <ChatView
-            key={current.id}
-            chat={current}
-            models={status?.models}
-            status={status}
-            refreshStatus={refreshStatus}
-            onOpenHome={() => go('home')}
-            initialText={pendingText}
-            onInitialConsumed={() => setPendingText('')}
-          />
+        {view === 'chat' && (
+          current ? (
+            <ChatView
+              key={current.id}
+              chat={current}
+              models={status?.models}
+              status={status}
+              refreshStatus={refreshStatus}
+              onOpenHome={() => go('home')}
+              initialText={pendingText}
+              onInitialConsumed={() => setPendingText('')}
+            />
+          ) : chatsLoaded ? (
+            <div className="empty-block">
+              <p>会话不存在或已被删除</p>
+              <button className="btn primary" onClick={() => navigate('#/')}>返回首页</button>
+            </div>
+          ) : null
         )}
         {view === 'kb' && <KnowledgeBase status={status} refreshStatus={refreshStatus} />}
         {view === 'settings' && <Settings status={status} refreshStatus={refreshStatus} />}
-        {view === 'admin' && <Admin />}
+        {view === 'admin' && user.role === 'admin' && <Admin />}
       </main>
     </div>
   );

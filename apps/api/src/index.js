@@ -33,6 +33,7 @@ import {
 } from './gateway.js';
 import { isSupported, ingestFile, retrieveChunks, buildKbContext, deleteFileArtifacts } from './kb.js';
 import { webSearch, searchStatus, SearchError } from './search.js';
+import { embeddingStatus } from './embedding.js';
 import { rateLimit } from './ratelimit.js';
 
 const app = express();
@@ -157,6 +158,7 @@ api.get('/status', auth, (req, res) => {
   res.json({
     keys: keyStatus(req.user.id),
     search: searchStatus(),
+    embedding: embeddingStatus(req.user.id),
     models: listModels().map((m) => ({ ...m, available: Boolean(resolveApiKey(req.user.id, m.provider).key) })),
     kbIds: parseJsonSafe(settings.kb_ids, []),
     quota: checkQuota(req.user),
@@ -402,11 +404,11 @@ api.post('/chat/stream', auth, async (req, res) => {
   if (kbIds.length && lastUser) {
     const ready = db.prepare(`SELECT id FROM files WHERE id IN (${kbIds.map(() => '?').join(',')}) AND user_id = ? AND status = 'ready'`).all(...kbIds, req.user.id).map((r) => r.id);
     if (ready.length) {
-      const chunks = retrieveChunks(req.user.id, lastUser.content, ready, 6);
+      const chunks = await retrieveChunks(req.user.id, lastUser.content, ready, 6);
       const context = buildKbContext(chunks);
       if (context) {
         llmMessages.push({ role: 'system', content: context });
-        notices.push({ type: 'kb', count: chunks.length, files: [...new Set(chunks.map((c) => c.fileName))] });
+        notices.push({ type: 'kb', count: chunks.length, via: chunks[0]?.via || 'keyword', files: [...new Set(chunks.map((c) => c.fileName))] });
       }
     }
   }

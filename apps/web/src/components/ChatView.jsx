@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { navigate } from '../lib/router.js';
 import { api, streamChat } from '../lib/api.js';
 import { Markdown } from '../markdown.jsx';
 
 function Notice({ notice }) {
   if (notice.type === 'kb') {
-    return <div className="notice"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20V4H6.5A2.5 2.5 0 004 6.5v13z" /></svg>已参考知识库：{notice.files.join('、')}（{notice.count} 个片段）</div>;
+    return <div className="notice"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20V4H6.5A2.5 2.5 0 004 6.5v13z" /></svg>已参考知识库{notice.via === 'hybrid' ? '（语义+关键词）' : ''}：{notice.files.join('、')}（{notice.count} 个片段）</div>;
   }
   if (notice.type === 'search') {
     return (
@@ -260,7 +261,7 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
           </div>
         )}
         {modelOptions.length === 0 && (
-          <div className="key-hint">尚未配置可用的模型 API Key —— <a href="#settings" onClick={(e) => { e.preventDefault(); window.dispatchEvent(new CustomEvent('vireo:navigate', { detail: 'settings' })); }}>去设置 →</a></div>
+          <div className="key-hint">尚未配置可用的模型 API Key —— <a href="#/settings" onClick={(e) => { e.preventDefault(); navigate('#/settings'); }}>去设置 →</a></div>
         )}
         <form className="composer" onSubmit={(e) => { e.preventDefault(); send(); }}>
           <input ref={fileRef} type="file" multiple hidden onChange={onUpload} accept=".txt,.md,.markdown,.csv,.tsv,.json,.log,.xml,.yml,.yaml" />

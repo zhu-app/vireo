@@ -1,4 +1,5 @@
 import React from 'react';
+import { navigate } from '../lib/router.js';
 
 const SUGGESTIONS = [
   { icon: '✍️', title: '帮我起草一封英文邮件', desc: '向海外团队同步项目延期，语气专业诚恳' },
@@ -19,7 +20,7 @@ export default function Home({ userName, status, onPick }) {
         {noKey && (
           <div className="hero-hint warn">
             <b>还没有可用的模型 Key。</b>
-            请到 <a href="#settings" onClick={(e) => { e.preventDefault(); window.dispatchEvent(new CustomEvent('vireo:navigate', { detail: 'settings' })); }}>设置</a>
+            请到 <a href="#/settings" onClick={(e) => { e.preventDefault(); navigate('#/settings'); }}>设置</a>
             {' '}填入你自己的 DeepSeek / OpenAI / 通义千问 API Key，或让管理员配置平台 Key。
           </div>
         )}

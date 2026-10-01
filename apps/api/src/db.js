@@ -59,7 +59,10 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
   user_id TEXT NOT NULL,
   idx INTEGER NOT NULL,
   text TEXT NOT NULL,
-  tokens INTEGER NOT NULL
+  tokens INTEGER NOT NULL,
+  vec BLOB,
+  vec_dim INTEGER,
+  embedding_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_user ON kb_chunks(user_id, file_id);
 CREATE TABLE IF NOT EXISTS settings (
@@ -86,6 +89,19 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage(user_id, created_at);
 `);
+
+// 幂等迁移：老库的 kb_chunks 没有向量列，逐列尝试 ALTER（列已存在则忽略）
+for (const ddl of [
+  'ALTER TABLE kb_chunks ADD COLUMN vec BLOB',
+  'ALTER TABLE kb_chunks ADD COLUMN vec_dim INTEGER',
+  'ALTER TABLE kb_chunks ADD COLUMN embedding_model TEXT',
+]) {
+  try {
+    db.exec(ddl);
+  } catch (error) {
+    if (!String(error.message).includes('duplicate column')) throw error;
+  }
+}
 
 const defaultSettings = {
   model: 'deepseek-chat',

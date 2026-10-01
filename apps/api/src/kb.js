@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { uploadDir } from './db.js';
 import db from './db.js';
 import { estimateTokens } from './gateway.js';
+import { embedTexts, packVector, unpackVector, cosine, EmbedError } from './embedding.js';
 
 const TEXT_EXT = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.log', '.xml', '.yml', '.yaml']);
 const MAX_FILE_BYTES = 5 * 1024 * 1024; // 解析上限 5MB
@@ -85,6 +86,29 @@ export function tokenize(text) {
   return [...new Set([...words.filter((w) => w.length > 1 && !STOP.has(w)), ...bigrams])];
 }
 
+/**
+ * 分块落库后补齐向量：
+ * - 供应商未配置 → 保持 vec 为 NULL，检索自动退化为关键词模式；
+ * - 调用失败 → 记录 note 但不推翻解析结果（关键词检索仍可用）。
+ */
+async function embedChunks(fileRow, chunks) {
+  let result;
+  try {
+    result = await embedTexts(chunks.map((c) => c.text), fileRow.user_id);
+  } catch (error) {
+    const note = error instanceof EmbedError ? error.message : String(error?.message || error);
+    db.prepare('UPDATE files SET note = ? WHERE id = ?').run(`向量检索不可用，已回退关键词检索：${note}`.slice(0, 300), fileRow.id);
+    return false;
+  }
+  if (!result || !result.vectors.length) return false;
+  const update = db.prepare('UPDATE kb_chunks SET vec = ?, vec_dim = ?, embedding_model = ? WHERE file_id = ? AND idx = ?');
+  const tx = db.transaction(() => {
+    result.vectors.forEach((vec, i) => update.run(packVector(vec), result.dim, result.model, fileRow.id, i));
+  });
+  tx();
+  return true;
+}
+
 export async function ingestFile(fileRow) {
   try {
     const abs = path.join(uploadDir, path.basename(fileRow.path));
@@ -95,13 +119,14 @@ export async function ingestFile(fileRow) {
     if (!raw.trim()) throw new Error('文件内容为空');
     const chunks = packChunks(splitParagraphs(raw));
     if (!chunks.length) throw new Error('未能从文件中提取到有效文本');
-    const insert = db.prepare('INSERT INTO kb_chunks (file_id, user_id, idx, text, tokens) VALUES (?, ?, ?, ?, ?)');
+    const insert = db.prepare('INSERT INTO kb_chunks (file_id, user_id, idx, text, tokens, vec, vec_dim, embedding_model) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)');
     db.prepare('DELETE FROM kb_chunks WHERE file_id = ?').run(fileRow.id);
     const tx = db.transaction(() => {
       chunks.forEach((c, i) => insert.run(fileRow.id, fileRow.user_id, i, c.text, c.tokens));
     });
     tx();
     db.prepare("UPDATE files SET status = 'ready', chunks = ?, note = NULL WHERE id = ?").run(chunks.length, fileRow.id);
+    await embedChunks(fileRow, chunks);
     return { chunks: chunks.length };
   } catch (error) {
     db.prepare("UPDATE files SET status = 'failed', note = ? WHERE id = ?").run(String(error.message || error).slice(0, 300), fileRow.id);
@@ -109,34 +134,81 @@ export async function ingestFile(fileRow) {
   }
 }
 
-export function retrieveChunks(userId, query, fileIds, topK = 6) {
+/**
+ * 混合检索：语义（向量余弦）+ 关键词（原 BM25 式打分）做 RRF 融合。
+ * - 供应商未配置 / query 向量化失败：自动回退为纯关键词检索（行为与旧版一致）。
+ * - 只有部分块有向量（如嵌入上线前入库的老文件）：老块仍参与关键词打分。
+ * 返回项附 via 字段（hybrid | keyword），供上层展示检索方式。
+ */
+export async function retrieveChunks(userId, query, fileIds, topK = 6) {
   if (!fileIds?.length) return [];
   const terms = tokenize(query);
-  if (!terms.length) return [];
   const placeholders = fileIds.map(() => '?').join(',');
   const rows = db
     .prepare(
-      `SELECT kc.id, kc.file_id, kc.text, kc.tokens, f.name
+      `SELECT kc.id, kc.file_id, kc.text, kc.tokens, kc.vec, kc.vec_dim, f.name
        FROM kb_chunks kc JOIN files f ON f.id = kc.file_id
        WHERE kc.user_id = ? AND kc.file_id IN (${placeholders})`
     )
     .all(userId, ...fileIds);
-  const scored = rows.map((row) => {
-    const hay = row.text.toLowerCase();
-    let score = 0;
-    for (const term of terms) {
-      let idx = -1;
-      let hits = 0;
-      while ((idx = hay.indexOf(term, idx + 1)) !== -1 && hits < 10) hits += 1;
-      if (hits) score += hits * (term.length >= 2 ? 1.5 : 1);
+  if (!rows.length) return [];
+
+  // 关键词打分（沿用原算法）
+  const keywordScored = rows
+    .map((row) => {
+      const hay = row.text.toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        let idx = -1;
+        let hits = 0;
+        while ((idx = hay.indexOf(term, idx + 1)) !== -1 && hits < 10) hits += 1;
+        if (hits) score += hits * (term.length >= 2 ? 1.5 : 1);
+      }
+      return { row, score };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  // 语义打分：查询向量 × 块向量（仅同维度的有效向量参与）
+  let semanticScored = [];
+  let queryVec = null;
+  try {
+    const embedded = await embedTexts([query], userId);
+    if (embedded?.vectors?.[0]) {
+      queryVec = Float32Array.from(embedded.vectors[0]);
+      const scored = [];
+      for (const row of rows) {
+        const vec = unpackVector(row.vec);
+        if (!vec || vec.length !== queryVec.length) continue;
+        scored.push({ row, score: cosine(queryVec, vec) });
+      }
+      semanticScored = scored.filter((x) => x.score > 0.05).sort((a, b) => b.score - a.score);
     }
-    return { ...row, score };
-  });
-  return scored
-    .filter((r) => r.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK)
-    .map(({ id, file_id, name, text, tokens, score }) => ({ id, fileId: file_id, fileName: name, text, tokens, score }));
+  } catch {
+    // 嵌入服务故障：静默回退关键词检索，检索可用性优先
+  }
+
+  if (!semanticScored.length) {
+    return keywordScored
+      .slice(0, topK)
+      .map(({ row, score }) => ({ id: row.id, fileId: row.file_id, fileName: row.name, text: row.text, tokens: row.tokens, score, via: 'keyword' }));
+  }
+
+  // RRF 融合：1/(k+排名) 相加，k=60 为通用取值，对分数尺度差异不敏感
+  const K = 60;
+  const fused = new Map(); // chunkId -> { row, rrf }
+  const addRank = (list, weight) => {
+    list.forEach(({ row }, rank) => {
+      const prev = fused.get(row.id);
+      const contrib = weight / (K + rank + 1);
+      if (prev) prev.rrf += contrib;
+      else fused.set(row.id, { row, rrf: contrib });
+    });
+  };
+  addRank(semanticScored, 1.15); // 语义权重略高：能召回关键词命不中的同义表述
+  addRank(keywordScored, 1);
+  const merged = [...fused.values()].sort((a, b) => b.rrf - a.rrf).slice(0, topK);
+  return merged.map(({ row, rrf }) => ({ id: row.id, fileId: row.file_id, fileName: row.name, text: row.text, tokens: row.tokens, score: rrf, via: 'hybrid' }));
 }
 
 export function buildKbContext(chunks, budget = 2400) {
