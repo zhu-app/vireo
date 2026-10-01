@@ -148,7 +148,7 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
 
     const history = buildHistory(base);
     streamRef.current = streamChat(
-      { chatId: chat.id, model, messages: history },
+      { chatId: chat.id, model, messages: history, regenerate },
       {
         onMeta: (meta) => {
           setMessages((cur) => {

@@ -142,11 +142,11 @@ test('会话与流式对话全链路（mock 上游）', async () => {
   firstAssistantId = msgs.json[1].id;
 });
 
-test('重新生成：新回复成功后才删除旧回复', async () => {
+test('重新生成：携带标志且新回复成功后才删除旧回复', async () => {
   const res = await fetch(`${BASE}/api/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
-    body: JSON.stringify({ chatId, requestId: 'req-e2e-0002', model: 'deepseek-chat', messages: [{ role: 'user', content: '你好' }] }),
+    body: JSON.stringify({ chatId, requestId: 'req-e2e-0002', model: 'deepseek-chat', messages: [{ role: 'user', content: '你好' }], regenerate: true }),
   });
   const sse = await res.text();
   assert.match(sse, /"done":true/);
@@ -157,8 +157,28 @@ test('重新生成：新回复成功后才删除旧回复', async () => {
   assert.notEqual(msgs.json[1].id, firstAssistantId);
 });
 
+test('普通连续发消息不删除上一条 AI 回复（丢记录回归）', async () => {
+  const before = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
+  const prevAssistantId = before.json[before.json.length - 1].id;
+  const res = await fetch(`${BASE}/api/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
+    body: JSON.stringify({ chatId, requestId: 'req-e2e-0004', model: 'deepseek-chat', messages: [
+      { role: 'user', content: '你好' },
+      { role: 'assistant', content: '你好，Vireo 在线' },
+      { role: 'user', content: '再答一次' },
+    ] }),
+  });
+  assert.match(await res.text(), /"done":true/);
+  const after = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
+  assert.equal(after.json.length, before.json.length + 2, '普通发送应追加 user+assistant，不删除任何历史');
+  assert.ok(after.json.some((m) => m.id === prevAssistantId), '上一条 AI 回复必须仍在库中');
+});
+
 test('模型调用失败时，旧回复必须保留（P0 回归）', async () => {
-  const keepId = (await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA })).json[1].id;
+  const before = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
+  const beforeLen = before.json.length;
+  const keepId = before.json.at(-1).id;
   // qwen-max 未配置任何 Key → 应报错，且不得删除已有回复
   const res = await fetch(`${BASE}/api/chat/stream`, {
     method: 'POST',
@@ -169,8 +189,9 @@ test('模型调用失败时，旧回复必须保留（P0 回归）', async () =>
   assert.match(sse, /"error"/);
 
   const msgs = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
-  assert.equal(msgs.json.length, 2);
-  assert.equal(msgs.json[1].id, keepId, '失败后旧助手回复原样保留');
+  // 失败请求只多落库了这条用户消息；上一条助手回复必须原样保留
+  assert.equal(msgs.json.length, beforeLen + 1, '仅新增用户消息，不删除任何历史');
+  assert.ok(msgs.json.some((m) => m.id === keepId), '失败后旧助手回复原样保留');
 });
 
 test('登录限流：同一邮箱高频尝试返回 429', async () => {

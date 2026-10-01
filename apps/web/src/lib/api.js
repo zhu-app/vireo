@@ -100,7 +100,7 @@ export const api = {
  * 流式对话。回调：onMeta(meta)、onDelta({content,reasoning})、onDone(stats)、回调异常不中断读取。
  * 返回 { stop() 主动停止 }
  */
-export function streamChat({ chatId, model, messages }, { onMeta, onDelta, onDone, onError }) {
+export function streamChat({ chatId, model, messages, regenerate = false }, { onMeta, onDelta, onDone, onError }) {
   const requestId = `req-${crypto.randomUUID()}`;
   const controller = new AbortController();
   (async () => {
@@ -113,7 +113,7 @@ export function streamChat({ chatId, model, messages }, { onMeta, onDelta, onDon
       const res = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` },
-        body: JSON.stringify({ chatId, requestId, model, messages }),
+        body: JSON.stringify({ chatId, requestId, model, messages, regenerate: regenerate || undefined }),
         signal: controller.signal,
       });
       if (!res.ok) {

@@ -77,6 +77,8 @@ const Z = {
         .refine((list) => list.reduce((sum, m) => sum + m.content.length, 0) <= 200_000, {
           message: '对话内容过长，请开启新对话或精简上下文后重试',
         }),
+      // 仅「重新生成」时替换上一条助手回复；普通发消息一律追加，绝不删除历史
+      regenerate: z.boolean().optional(),
     })
     .refine((b) => b.messages.some((m) => m.role === 'user' && m.content.trim()), {
       message: '缺少用户消息',
@@ -403,11 +405,12 @@ api.post('/chat/stream', auth, async (req, res) => {
   const history = body.messages.filter((m) => m.role !== 'system');
   const lastUser = [...history].reverse().find((m) => m.role === 'user');
 
-  // 重新生成时，旧助手回复先保留在库里，等新回复成功落库后再删除；
-  // 否则上游一旦报错，用户既丢旧答案又拿不到新答案。
-  const priorAssistant = db
-    .prepare("SELECT * FROM messages WHERE chat_id = ? AND role = 'assistant' ORDER BY created_at DESC, id DESC LIMIT 1")
-    .get(chat.id);
+  // 仅「重新生成」才定位上一条助手回复（且保留到成功落库后再删除）；
+  // 普通发消息一律追加，绝不删除历史——旧版无条件顶掉上一条回复，导致刷新后记录丢失。
+  const isRegenerate = body.regenerate === true;
+  const priorAssistant = isRegenerate
+    ? db.prepare("SELECT * FROM messages WHERE chat_id = ? AND role = 'assistant' ORDER BY created_at DESC, id DESC LIMIT 1").get(chat.id)
+    : null;
 
   // 幂等：若最后一条用户消息尚未落库（首次发送场景），先保存
   const lastSaved = db.prepare("SELECT * FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY created_at DESC, id DESC LIMIT 1").get(chat.id);
