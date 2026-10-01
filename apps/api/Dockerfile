@@ -10,8 +10,8 @@ FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 ENV DATA_DIR=/app/data
-# 非 root 运行
-RUN groupadd -r nodeapp && useradd -r -g nodeapp nodeapp
+# 非 root 运行（Alpine 无 groupadd/useradd，须用 busybox 的 addgroup/adduser）
+RUN addgroup -S nodeapp && adduser -S -D -G nodeapp nodeapp
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY apps/api ./apps/api
