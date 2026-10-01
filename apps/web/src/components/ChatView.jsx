@@ -256,7 +256,7 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
         {messages.length === 0 && (
           <div className="chat-hint">
             <span className="logo-mark lg" />
-            <p>开始和 {currentModel?.name || '模型'} 对话吧</p>
+            <p>开始和 Vireo 对话吧</p>
             {status?.kbIds?.length > 0 && <p className="muted">知识库已启用，回答会引用你上传的资料</p>}
           </div>
         )}
