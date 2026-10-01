@@ -35,6 +35,31 @@ const MODELS = [
  */
 const DYNAMIC_KEY = 'dynamic_models';
 
+/** 常见模型品牌词：美化显示名时映射为官方写法 */
+const BRAND_MAP = {
+  deepseek: 'DeepSeek', qwen: 'Qwen', glm: 'GLM', kimi: 'Kimi', llama: 'Llama',
+  claude: 'Claude', gemini: 'Gemini', ernie: 'ERNIE', doubao: 'Doubao', moonshot: 'Moonshot',
+};
+
+/**
+ * 把模型 id 美化为可读显示名：deepseek-v4-pro → DeepSeek V4 Pro；gpt-4o → GPT 4o。
+ * 未识别的片段仅首字母大写；纯数字保留；4o/4.1 这类带小写后缀的规格保留原样。
+ */
+export function prettifyModelName(id) {
+  const tokens = String(id || '').split(/[-_.]+/).filter(Boolean);
+  return tokens
+    .map((token) => {
+      const lower = token.toLowerCase();
+      if (lower === 'gpt') return 'GPT';
+      if (BRAND_MAP[lower]) return BRAND_MAP[lower];
+      if (/^\d+[a-z]$/.test(lower)) return lower; // 4o 这类规格后缀
+      if (/^v\d+(\.\d+)?$/.test(lower)) return lower.toUpperCase(); // v4 → V4
+      if (/^\d+$/.test(lower)) return lower; // 日期/版本号数字
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join(' ');
+}
+
 /** 明显不是对话模型的 id 特征（embedding、语音、图像、视频、审核等；whisper/sora 等专名单独列出） */
 const NON_CHAT_PATTERN = /(embedding|moderation|audio|realtime|transcribe|translate|tts|whisper|speech|voice|dall[\w-]*e|sora|image|video|rerank|ocr|asr)/i;
 
@@ -48,7 +73,7 @@ function loadDynamicModels() {
       out.push({
         id: m.id,
         provider,
-        name: m.name || m.id,
+        name: m.name && m.name !== m.id ? m.name : prettifyModelName(m.id),
         reasoning: Boolean(m.reasoning),
         vision: false,
         desc: '上游发现',
@@ -105,7 +130,7 @@ export async function discoverModels(userId, provider) {
   for (const item of items) {
     const id = String(item?.id || '');
     if (!id || id.length > 60 || NON_CHAT_PATTERN.test(id) || builtinIds.has(id)) continue;
-    discovered.push({ id, name: id, reasoning: /(reason|r1|thinking)/i.test(id), discovered_at: Date.now() });
+    discovered.push({ id, name: prettifyModelName(id), reasoning: /(reason|r1|thinking)/i.test(id), discovered_at: Date.now() });
   }
   if (!discovered.length) throw new GatewayError(`${meta.name} 未发现可对话的新模型（列表为空或全部已内置）`, 502);
 

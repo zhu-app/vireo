@@ -338,6 +338,7 @@ test('发现上游模型：过滤非对话类与内置项', async () => {
   // mock 返回 6 个：2 内置重复 + embedding/dall-e/whisper 被过滤，仅剩 deepseek-v4-flash
   assert.equal(r.json.count, 1);
   assert.equal(r.json.models[0].id, 'deepseek-v4-flash');
+  assert.equal(r.json.models[0].name, 'DeepSeek V4 Flash', '应美化为友好显示名');
 
   const list = await api('GET', '/api/models', { token: tokenA });
   assert.equal(list.json.length, 5, '内置 4 + 动态 1');

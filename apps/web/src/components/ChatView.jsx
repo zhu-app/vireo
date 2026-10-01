@@ -244,7 +244,7 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
             ).map(([provider, list]) => (
               <optgroup key={provider} label={PROVIDER_NAMES[provider] || provider}>
                 {list.map((m) => (
-                  <option key={m.id} value={m.id}>{m.name}{m.dynamic ? '（已发现）' : m.reasoning ? ' · 思考' : ''}</option>
+                  <option key={m.id} value={m.id}>{m.name}{m.reasoning ? ' · 思考' : ''}</option>
                 ))}
               </optgroup>
             ))}
