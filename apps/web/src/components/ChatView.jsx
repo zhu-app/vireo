@@ -3,6 +3,8 @@ import { navigate } from '../lib/router.js';
 import { api, streamChat } from '../lib/api.js';
 import { Markdown } from '../markdown.jsx';
 
+const PROVIDER_NAMES = { deepseek: 'DeepSeek', openai: 'OpenAI', qwen: '通义千问' };
+
 function Notice({ notice }) {
   if (notice.type === 'kb') {
     return <div className="notice"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20V4H6.5A2.5 2.5 0 004 6.5v13z" /></svg>已参考知识库{notice.via === 'hybrid' ? '（语义+关键词）' : ''}：{notice.files.join('、')}（{notice.count} 个片段）</div>;
@@ -233,8 +235,18 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
             <span>联网</span>
           </label>
           <select className="model-select" value={model} onChange={(e) => setModel(e.target.value)} title="当前模型">
-            {(modelOptions.length ? modelOptions : [currentModel || { id: model, name: model }]).map((m) => (
-              <option key={m.id} value={m.id}>{m.name}</option>
+            {Object.entries(
+              (modelOptions.length ? modelOptions : [currentModel || { id: model, name: model, provider: 'deepseek' }]).reduce((groups, m) => {
+                const key = m.provider || 'other';
+                (groups[key] ||= []).push(m);
+                return groups;
+              }, {})
+            ).map(([provider, list]) => (
+              <optgroup key={provider} label={PROVIDER_NAMES[provider] || provider}>
+                {list.map((m) => (
+                  <option key={m.id} value={m.id}>{m.name}{m.dynamic ? '（已发现）' : m.reasoning ? ' · 思考' : ''}</option>
+                ))}
+              </optgroup>
             ))}
           </select>
         </div>

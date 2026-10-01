@@ -14,6 +14,39 @@ export default function Settings({ status, refreshStatus }) {
   const [busy, setBusy] = useState(false);
   const [searchTest, setSearchTest] = useState('');
   const [searchResult, setSearchResult] = useState(null);
+  const [models, setModels] = useState([]);
+  const [discoverBusy, setDiscoverBusy] = useState('');
+  const [discoverMsg, setDiscoverMsg] = useState('');
+
+  const loadModels = () => api.models().then(setModels).catch(() => {});
+  useEffect(() => { loadModels(); }, []);
+
+  async function discover(providerId) {
+    setDiscoverBusy(providerId);
+    setDiscoverMsg('');
+    setError('');
+    try {
+      const r = await api.discoverModels(providerId);
+      setDiscoverMsg(`✓ ${providerId} 已发现 ${r.count} 个可对话模型（${r.models.slice(0, 5).map((m) => m.id).join('、')}${r.count > 5 ? '…' : ''}），已加入对话页下拉框`);
+      await loadModels();
+      refreshStatus?.();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDiscoverBusy('');
+    }
+  }
+
+  async function removeModel(id) {
+    if (!window.confirm(`移除动态模型「${id}」？内置模型不受影响。`)) return;
+    try {
+      await api.removeModel(id);
+      await loadModels();
+      refreshStatus?.();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
 
   useEffect(() => {
     if (status?.keys) setKeys(Object.fromEntries(PROVIDERS.map((p) => [p.id, ''])));
@@ -65,14 +98,34 @@ export default function Settings({ status, refreshStatus }) {
                 value={keys[p.id] || ''}
                 onChange={(e) => setKeys((k) => ({ ...k, [p.id]: e.target.value }))}
               />
+              {info?.configured && (
+                <button className="btn" onClick={() => discover(p.id)} disabled={Boolean(discoverBusy)}>
+                  {discoverBusy === p.id ? '获取中…' : '获取模型列表'}
+                </button>
+              )}
             </div>
           );
         })}
         {error && <div className="page-error">{error}</div>}
+        {discoverMsg && <div className="notice ok">{discoverMsg}</div>}
         <div className="row-actions">
           <button className="btn primary" onClick={saveKeys} disabled={busy || !Object.values(keys).some((v) => v.trim())}>{busy ? '保存中…' : '保存密钥'}</button>
           {saved && <span className="saved-tip">✓ 已保存</span>}
         </div>
+      </section>
+
+      <section className="card">
+        <h3>可用模型（{models.length}）</h3>
+        <p className="muted card-desc">内置 4 个 + 上游发现的动态模型。「获取模型列表」会拉取该 Key 对应供应商的真实模型清单（已过滤 embedding/语音等非对话模型），发现结果全平台共享。</p>
+        <ul className="model-list">
+          {models.map((m) => (
+            <li key={m.id} className={m.available ? '' : 'unavailable'}>
+              <span className="model-name"><b>{m.name}</b><code>{m.id}</code>{m.reasoning && <em className="tag">思考</em>}{m.vision && <em className="tag">视觉</em>}{m.dynamic && <em className="tag dyn">动态</em>}</span>
+              <span className="model-prov">{PROVIDERS.find((p) => p.id === m.provider)?.name || m.provider}{m.available ? '' : ' · 无 Key 不可用'}</span>
+              {m.dynamic && <button className="icon-btn" title="移除该动态模型" onClick={() => removeModel(m.id)}>×</button>}
+            </li>
+          ))}
+        </ul>
       </section>
 
       <section className="card">

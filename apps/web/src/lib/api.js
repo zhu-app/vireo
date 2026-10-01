@@ -52,6 +52,8 @@ export const api = {
   login: (body) => request('/api/auth/login', { method: 'POST', body: JSON.stringify(body) }),
   me: () => request('/api/auth/me'),
   models: () => request('/api/models'),
+  discoverModels: (provider) => request('/api/models/discover', { method: 'POST', body: JSON.stringify({ provider }) }),
+  removeModel: (id) => request(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   status: () => request('/api/status'),
   chats: () => request('/api/chats'),
   createChat: (body = {}) => request('/api/chats', { method: 'POST', body: JSON.stringify(body) }),

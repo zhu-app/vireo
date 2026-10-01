@@ -29,6 +29,8 @@ import {
   writeSseHead,
   GatewayError,
   maskKey,
+  discoverModels,
+  removeDynamicModel,
   PROVIDER_DEFAULTS,
 } from './gateway.js';
 import { isSupported, ingestFile, retrieveChunks, buildKbContext, deleteFileArtifacts } from './kb.js';
@@ -151,7 +153,27 @@ api.post('/auth/login', authLimiter, loginLimiter, (req, res) => {
 api.get('/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
 // ---------- 模型与状态 ----------
-api.get('/models', auth, (_, res) => res.json(listModels()));
+api.get('/models', auth, (req, res) => res.json(listModels().map((m) => ({ ...m, available: Boolean(resolveApiKey(req.user.id, m.provider).key) }))));
+
+// 从上游拉取真实模型列表（过滤非对话类），持久化后全平台共享
+api.post('/models/discover', auth, rateLimit({ windowMs: 60_000, max: 5, message: '获取模型列表过于频繁，请稍后再试' }), async (req, res) => {
+  const provider = z.enum(['deepseek', 'openai', 'qwen']).safeParse(req.body?.provider);
+  if (!provider.success) return res.status(400).json({ error: '请指定供应商（deepseek / openai / qwen）' });
+  try {
+    const discovered = await discoverModels(req.user.id, provider.data);
+    res.json({ count: discovered.length, models: discovered });
+  } catch (error) {
+    if (error instanceof GatewayError) return res.status(error.status === 499 ? 502 : error.status).json({ error: error.message });
+    res.status(500).json({ error: '获取模型列表失败，请稍后再试' });
+  }
+});
+
+// 移除一个动态发现的模型（内置模型不可删）
+api.delete('/models/:id', auth, (req, res) => {
+  const removed = removeDynamicModel(req.params.id);
+  if (!removed) return res.status(400).json({ error: '内置模型不可移除，或该动态模型不存在' });
+  res.json({ ok: true, removed });
+});
 
 api.get('/status', auth, (req, res) => {
   const settings = getSettings(req.user.id);

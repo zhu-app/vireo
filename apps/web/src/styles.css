@@ -511,7 +511,7 @@ a:hover { text-decoration: underline; }
 
 /* 设置页 */
 .key-row {
-  display: grid; grid-template-columns: minmax(160px, 1fr) 170px minmax(180px, 1.6fr);
+  display: grid; grid-template-columns: minmax(160px, 1fr) 170px minmax(180px, 1.4fr) auto;
   gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px dashed var(--border);
 }
 .key-row:last-of-type { border-bottom: none; }
@@ -525,6 +525,19 @@ a:hover { text-decoration: underline; }
 .search-results { list-style: none; padding: 0; margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
 .search-results li { font-size: 13px; background: var(--bg-sunken); border-radius: var(--radius-s); padding: 8px 12px; }
 .search-results i { display: block; font-style: normal; color: var(--text-3); font-size: 12px; margin-top: 3px; }
+
+/* 可用模型列表 */
+.model-list { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
+.model-list li {
+  display: flex; align-items: center; gap: 10px; font-size: 13px;
+  background: var(--bg-sunken); border-radius: var(--radius-s); padding: 7px 12px;
+}
+.model-list li.unavailable { opacity: 0.55; }
+.model-name { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.model-name code { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-name .tag { font-style: normal; font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 999px; background: rgba(77, 107, 254, 0.12); color: var(--accent, #4d6bfe); white-space: nowrap; }
+.model-name .tag.dyn { background: rgba(159, 85, 246, 0.12); color: #9f55f6; }
+.model-prov { font-size: 12px; color: var(--text-3); white-space: nowrap; }
 
 /* 管理页 */
 .tabs { display: flex; gap: 4px; background: var(--bg-sunken); padding: 4px; border-radius: var(--radius-s); }

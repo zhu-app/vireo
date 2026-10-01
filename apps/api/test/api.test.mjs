@@ -25,6 +25,21 @@ process.env.PORT = String(API_PORT);
 
 // mock 上游：标准 OpenAI 兼容 SSE + 简化 embeddings（含"猫"→[1,0]，否则[0,1]）
 const mockServer = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url.endsWith('/models')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      object: 'list',
+      data: [
+        { id: 'deepseek-chat', object: 'model' },
+        { id: 'deepseek-reasoner', object: 'model' },
+        { id: 'deepseek-v4-flash', object: 'model' },
+        { id: 'text-embedding-3-small', object: 'model' },
+        { id: 'dall-e-3', object: 'model' },
+        { id: 'whisper-1', object: 'model' },
+      ],
+    }));
+    return;
+  }
   let raw = '';
   req.on('data', (c) => (raw += c));
   req.on('end', () => {
@@ -286,6 +301,62 @@ test('未配置嵌入服务时回退关键词检索', async () => {
   } finally {
     if (savedKey) process.env.OPENAI_API_KEY = savedKey;
   }
+});
+
+// ---------- 模型发现（动态模型列表） ----------
+test('模型列表初始为内置 4 个', async () => {
+  const r = await api('GET', '/api/models', { token: tokenA });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.length, 4);
+  assert.ok(r.json.every((m) => !m.dynamic));
+});
+
+test('发现上游模型：过滤非对话类与内置项', async () => {
+  const r = await api('POST', '/api/models/discover', { token: tokenA, body: { provider: 'deepseek' } });
+  assert.equal(r.status, 200);
+  // mock 返回 6 个：2 内置重复 + embedding/dall-e/whisper 被过滤，仅剩 deepseek-v4-flash
+  assert.equal(r.json.count, 1);
+  assert.equal(r.json.models[0].id, 'deepseek-v4-flash');
+
+  const list = await api('GET', '/api/models', { token: tokenA });
+  assert.equal(list.json.length, 5, '内置 4 + 动态 1');
+  const dyn = list.json.find((m) => m.id === 'deepseek-v4-flash');
+  assert.equal(dyn.dynamic, true);
+  assert.equal(dyn.provider, 'deepseek');
+  assert.equal(dyn.available, true, 'deepseek 有 env Key 应可用');
+});
+
+test('发现的动态模型可直接发起对话', async () => {
+  const res = await fetch(`${BASE}/api/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
+    body: JSON.stringify({ chatId, requestId: 'req-dyn-0001', model: 'deepseek-v4-flash', messages: [{ role: 'user', content: '动态模型测试' }] }),
+  });
+  const sse = await res.text();
+  assert.match(sse, /"done":true/);
+  assert.doesNotMatch(sse, /"error"/);
+});
+
+test('未配 Key 的供应商发现返回 400', async () => {
+  const savedQwen = process.env.DASHSCOPE_API_KEY;
+  delete process.env.DASHSCOPE_API_KEY;
+  try {
+    const r = await api('POST', '/api/models/discover', { token: tokenA, body: { provider: 'qwen' } });
+    assert.equal(r.status, 400);
+    assert.match(r.json.error, /未配置/);
+  } finally {
+    if (savedQwen) process.env.DASHSCOPE_API_KEY = savedQwen;
+  }
+});
+
+test('内置模型不可移除，动态模型可移除', async () => {
+  const builtin = await api('DELETE', '/api/models/deepseek-chat', { token: tokenA });
+  assert.equal(builtin.status, 400);
+
+  const removed = await api('DELETE', '/api/models/deepseek-v4-flash', { token: tokenA });
+  assert.equal(removed.status, 200);
+  const list = await api('GET', '/api/models', { token: tokenA });
+  assert.equal(list.json.length, 4, '移除后回到内置 4 个');
 });
 
 // ---------- 管理端 ----------

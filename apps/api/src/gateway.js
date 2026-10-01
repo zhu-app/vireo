@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import db, { getSettings, parseJsonSafe, settingValue, todayStart } from './db.js';
+import db, { getSettings, parseJsonSafe, settingValue, setSettingValue, todayStart } from './db.js';
 
 const PROVIDER_DEFAULTS = {
   deepseek: {
@@ -29,12 +29,107 @@ const MODELS = [
   { id: 'qwen-max', provider: 'qwen', name: '通义千问 Max', reasoning: false, vision: false, desc: '中文能力突出' },
 ];
 
+/**
+ * 动态模型（上游 /models 接口发现后持久化在 platform_settings，全平台共享）
+ * 存储结构：{ [provider]: [{ id, name, reasoning, discovered_at }] }
+ */
+const DYNAMIC_KEY = 'dynamic_models';
+
+/** 明显不是对话模型的 id 特征（embedding、语音、图像、视频、审核等；whisper/sora 等专名单独列出） */
+const NON_CHAT_PATTERN = /(embedding|moderation|audio|realtime|transcribe|translate|tts|whisper|speech|voice|dall[\w-]*e|sora|image|video|rerank|ocr|asr)/i;
+
+function loadDynamicModels() {
+  const stored = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
+  const out = [];
+  for (const [provider, list] of Object.entries(stored)) {
+    if (!PROVIDER_DEFAULTS[provider] || !Array.isArray(list)) continue;
+    for (const m of list) {
+      if (!m?.id) continue;
+      out.push({
+        id: m.id,
+        provider,
+        name: m.name || m.id,
+        reasoning: Boolean(m.reasoning),
+        vision: false,
+        desc: '上游发现',
+        dynamic: true,
+      });
+    }
+  }
+  return out;
+}
+
+/** 内置 + 动态合并视图；动态模型若与内置同 id 则忽略（内置定义信息更全） */
+function allModels() {
+  const builtinIds = new Set(MODELS.map((m) => m.id));
+  return [...MODELS, ...loadDynamicModels().filter((m) => !builtinIds.has(m.id))];
+}
+
 export function listModels() {
-  return MODELS;
+  return allModels();
 }
 
 export function getModel(modelId) {
-  return MODELS.find((m) => m.id === modelId) || null;
+  return allModels().find((m) => m.id === modelId) || null;
+}
+
+/**
+ * 从供应商上游拉取模型列表，过滤非对话类后持久化（同供应商整体替换）。
+ * 返回新增的模型数组；失败抛 GatewayError。
+ */
+export async function discoverModels(userId, provider) {
+  const meta = PROVIDER_DEFAULTS[provider];
+  if (!meta) throw new GatewayError(`不支持的供应商：${provider}`, 400);
+  const { key } = resolveApiKey(userId, provider);
+  if (!key) throw new GatewayError(`${meta.name} 的 API Key 未配置，无法获取模型列表`, 400);
+
+  const base = /\/v\d+$/.test(meta.baseUrl) ? meta.baseUrl : `${meta.baseUrl.replace(/\/$/, '')}/v1`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(process.env.UPSTREAM_TIMEOUT_MS || 30_000));
+  let upstream;
+  try {
+    upstream = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: controller.signal });
+  } catch (error) {
+    throw new GatewayError(`无法连接 ${meta.name} 模型列表接口：${error.message}`, 502);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!upstream.ok) {
+    const detail = (await upstream.text().catch(() => '')).slice(0, 200);
+    throw new GatewayError(`${meta.name} 模型列表接口返回错误（${upstream.status}）：${detail}`, 502);
+  }
+  const json = await upstream.json().catch(() => null);
+  const items = Array.isArray(json?.data) ? json.data : [];
+  const builtinIds = new Set(MODELS.filter((m) => m.provider === provider).map((m) => m.id));
+  const discovered = [];
+  for (const item of items) {
+    const id = String(item?.id || '');
+    if (!id || id.length > 60 || NON_CHAT_PATTERN.test(id) || builtinIds.has(id)) continue;
+    discovered.push({ id, name: id, reasoning: /(reason|r1|thinking)/i.test(id), discovered_at: Date.now() });
+  }
+  if (!discovered.length) throw new GatewayError(`${meta.name} 未发现可对话的新模型（列表为空或全部已内置）`, 502);
+
+  const stored = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
+  stored[provider] = discovered.slice(0, 100); // 防异常响应撑爆设置表
+  setSettingValue(DYNAMIC_KEY, JSON.stringify(stored));
+  return discovered;
+}
+
+/** 删除某个动态模型（内置不可删） */
+export function removeDynamicModel(modelId) {
+  const stored = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
+  let removed = null;
+  for (const [provider, list] of Object.entries(stored)) {
+    if (!Array.isArray(list)) continue;
+    const keep = list.filter((m) => m?.id !== modelId);
+    if (keep.length !== list.length) {
+      removed = modelId;
+      if (keep.length) stored[provider] = keep;
+      else delete stored[provider];
+    }
+  }
+  if (removed) setSettingValue(DYNAMIC_KEY, JSON.stringify(stored));
+  return removed;
 }
 
 function maskKey(key) {
