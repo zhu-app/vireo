@@ -1,0 +1,14 @@
+{
+  "name": "vireo-ai-platform",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "npm run dev -w @vireo/api",
+    "dev:api": "npm run dev -w @vireo/api",
+    "dev:web": "npm run dev -w @vireo/web",
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces"
+  },
+  "engines": { "node": ">=20" }
+}

@@ -1,0 +1,45 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    image: vireo-api:latest
+    environment:
+      PORT: 8080
+      DATA_DIR: /app/data
+      JWT_SECRET: ${JWT_SECRET:?请在 infra/.env 中设置 JWT_SECRET}
+      # 不再内置弱默认值：首次部署必须显式设置管理员密码，否则按缺失处理不落库
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?请在 infra/.env 中设置 DEFAULT_ADMIN_PASSWORD}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      SEARCH_API_KEY: ${SEARCH_API_KEY:-}
+    volumes:
+      - vireo_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+    image: vireo-web:latest
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/index.html"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 256m
+
+volumes:
+  vireo_data:

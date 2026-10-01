@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装依赖（锁定 lockfile）
+        run: npm ci --no-audit --no-fund
+
+      - name: 后端语法检查
+        run: node --check apps/api/src/index.js && node --check apps/api/src/gateway.js && node --check apps/api/src/auth.js && node --check apps/api/src/db.js && node --check apps/api/src/kb.js && node --check apps/api/src/search.js && node --check apps/api/src/ratelimit.js
+
+      - name: 后端集成测试
+        run: npm test -w @vireo/api
+
+      - name: 前端构建
+        run: npm run build -w @vireo/web
+
+      - name: 前端测试（当前无用例，passWithNoTests）
+        run: npm test -w @vireo/web
+
+  docker:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建 API 镜像（不推送）
+        run: docker build -f apps/api/Dockerfile -t vireo-api:ci .
+      - name: 构建 Web 镜像（不推送）
+        run: docker build -f apps/web/Dockerfile -t vireo-web:ci .

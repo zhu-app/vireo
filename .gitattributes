@@ -1,0 +1,5 @@
+# 统一换行符：仓库内一律 LF，避免 Windows 检出后 Docker/nginx/sh 配置带 CRLF
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

@@ -1,0 +1,15 @@
+# 构建上下文瘦身：以下文件不应进入 Docker build context
+# （node_modules 与本机平台相关；data 含真实用户数据，绝对不能打进镜像）
+**/node_modules
+**/dist
+apps/api/data
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.env
+infra/.env
+.git
+.gitignore
+*.md
+.dockerignore
+apps/web/dist
