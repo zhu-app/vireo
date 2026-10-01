@@ -1,18 +1,13 @@
 import crypto from 'node:crypto';
 import db, { getSettings, parseJsonSafe, settingValue, setSettingValue, todayStart } from './db.js';
 
+// 内置供应商只保留 DeepSeek 与通义千问；其他一律走「自定义供应商」（OpenAI 兼容接口）
 const PROVIDER_DEFAULTS = {
   deepseek: {
     name: 'DeepSeek',
     baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
     keyEnv: 'DEEPSEEK_API_KEY',
     keySetting: 'platform_deepseek_key',
-  },
-  openai: {
-    name: 'OpenAI',
-    baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
-    keyEnv: 'OPENAI_API_KEY',
-    keySetting: 'platform_openai_key',
   },
   qwen: {
     name: '通义千问',
@@ -22,18 +17,111 @@ const PROVIDER_DEFAULTS = {
   },
 };
 
-const MODELS = [
-  { id: 'deepseek-chat', provider: 'deepseek', name: 'DeepSeek Chat', reasoning: false, vision: false, desc: '通用对话，响应快' },
-  { id: 'deepseek-reasoner', provider: 'deepseek', name: 'DeepSeek Reasoner', reasoning: true, vision: false, desc: '深度思考，适合复杂推理' },
-  { id: 'gpt-4o', provider: 'openai', name: 'GPT-4o', reasoning: false, vision: true, desc: '多模态旗舰模型' },
-  { id: 'qwen-max', provider: 'qwen', name: '通义千问 Max', reasoning: false, vision: false, desc: '中文能力突出' },
-];
+// 不再内置任何默认模型：所有模型都来自「填入 Key → 获取模型列表」的发现结果
+const MODELS = [];
 
 /**
  * 动态模型（上游 /models 接口发现后持久化在 platform_settings，全平台共享）
  * 存储结构：{ [provider]: [{ id, name, reasoning, discovered_at }] }
  */
 const DYNAMIC_KEY = 'dynamic_models';
+
+/** 自定义供应商存储：{ [id]: { id, name, baseUrl, createdAt } }，平台级共享 */
+const CUSTOM_PROVIDERS_KEY = 'custom_providers';
+const MAX_CUSTOM_PROVIDERS = 20;
+
+function loadCustomProviders() {
+  const stored = parseJsonSafe(settingValue(CUSTOM_PROVIDERS_KEY), {});
+  return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+}
+
+function saveCustomProviders(map) {
+  setSettingValue(CUSTOM_PROVIDERS_KEY, JSON.stringify(map));
+}
+
+function customKeySetting(id) {
+  return `platform_custom_key:${id}`;
+}
+
+/** 统一供应商元信息入口：内置优先，其次自定义 */
+export function getProviderMeta(provider) {
+  if (PROVIDER_DEFAULTS[provider]) return { id: provider, ...PROVIDER_DEFAULTS[provider], custom: false };
+  const custom = loadCustomProviders()[provider];
+  if (custom) return { id: provider, name: custom.name, baseUrl: custom.baseUrl, keySetting: customKeySetting(provider), custom: true };
+  return null;
+}
+
+/** 全部供应商（内置 + 自定义），供前端展示与分组 */
+export function listProviders() {
+  const custom = Object.values(loadCustomProviders()).map((c) => ({ id: c.id, name: c.name, baseUrl: c.baseUrl, custom: true }));
+  const builtin = Object.entries(PROVIDER_DEFAULTS).map(([id, meta]) => ({ id, name: meta.name, baseUrl: meta.baseUrl, custom: false }));
+  return [...builtin, ...custom.sort((a, b) => a.name.localeCompare(b.name))];
+}
+
+function slugify(text) {
+  const ascii = String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return ascii.slice(0, 24) || `cp-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+export class ProviderError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** 新增自定义供应商；key 可选（平台级共享 Key） */
+export function addProvider({ name, baseUrl, key }) {
+  const trimmedName = String(name || '').trim();
+  const url = String(baseUrl || '').trim();
+  if (!trimmedName || trimmedName.length > 40) throw new ProviderError('供应商名称需为 1-40 个字符');
+  if (!/^https?:\/\/[^\s]+$/i.test(url)) throw new ProviderError('接口地址需以 http:// 或 https:// 开头');
+  const map = loadCustomProviders();
+  if (Object.keys(map).length >= MAX_CUSTOM_PROVIDERS) throw new ProviderError(`自定义供应商数量已达上限（${MAX_CUSTOM_PROVIDERS}）`);
+  if (PROVIDER_DEFAULTS[trimmedName.toLowerCase()]) throw new ProviderError('该名称与内置供应商冲突');
+  let id = slugify(trimmedName);
+  while (map[id] || PROVIDER_DEFAULTS[id]) id = `${id}-${crypto.randomBytes(2).toString('hex')}`;
+  map[id] = { id, name: trimmedName, baseUrl: url.replace(/\/+$/, ''), createdAt: Date.now() };
+  saveCustomProviders(map);
+  if (key) setSettingValue(customKeySetting(id), String(key).trim());
+  return map[id];
+}
+
+/** 更新自定义供应商（名称/地址/平台 Key） */
+export function updateProvider(id, { name, baseUrl, key }) {
+  const map = loadCustomProviders();
+  if (!map[id]) throw new ProviderError('自定义供应商不存在', 404);
+  if (name !== undefined) {
+    const trimmedName = String(name).trim();
+    if (!trimmedName || trimmedName.length > 40) throw new ProviderError('供应商名称需为 1-40 个字符');
+    map[id].name = trimmedName;
+  }
+  if (baseUrl !== undefined) {
+    if (!/^https?:\/\/[^\s]+$/i.test(baseUrl)) throw new ProviderError('接口地址需以 http:// 或 https:// 开头');
+    map[id].baseUrl = String(baseUrl).trim().replace(/\/+$/, '');
+  }
+  if (key !== undefined) {
+    const trimmed = String(key).trim();
+    if (trimmed && !trimmed.includes('*')) setSettingValue(customKeySetting(id), trimmed);
+  }
+  saveCustomProviders(map);
+  return map[id];
+}
+
+/** 删除自定义供应商，连带清理其平台 Key 与已发现的模型 */
+export function deleteProvider(id) {
+  const map = loadCustomProviders();
+  if (!map[id]) throw new ProviderError('自定义供应商不存在', 404);
+  delete map[id];
+  saveCustomProviders(map);
+  setSettingValue(customKeySetting(id), null);
+  const dyn = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
+  if (dyn[id]) {
+    delete dyn[id];
+    setSettingValue(DYNAMIC_KEY, JSON.stringify(dyn));
+  }
+  return true;
+}
 
 /** 常见模型品牌词：美化显示名时映射为官方写法 */
 const BRAND_MAP = {
@@ -66,10 +154,12 @@ const NON_CHAT_PATTERN = /(embedding|moderation|audio|realtime|transcribe|transl
 function loadDynamicModels() {
   const stored = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
   const out = [];
+  const seen = new Set(); // 同一 id 可能被多个供应商发现，仅保留首个
   for (const [provider, list] of Object.entries(stored)) {
-    if (!PROVIDER_DEFAULTS[provider] || !Array.isArray(list)) continue;
+    if (!getProviderMeta(provider) || !Array.isArray(list)) continue;
     for (const m of list) {
-      if (!m?.id) continue;
+      if (!m?.id || seen.has(m.id)) continue;
+      seen.add(m.id);
       out.push({
         id: m.id,
         provider,
@@ -98,12 +188,27 @@ export function getModel(modelId) {
   return allModels().find((m) => m.id === modelId) || null;
 }
 
+/** 启动时一次性迁移：把指向不存在模型（如旧版内置 deepseek-chat）的默认值清空，由用户重新选择 */
+export function migrateStaleModelRefs() {
+  const valid = new Set(allModels().map((m) => m.id));
+  let cleared = 0;
+  for (const row of db.prepare("SELECT user_id, model FROM settings WHERE model <> ''").all()) {
+    if (!valid.has(row.model)) {
+      db.prepare("UPDATE settings SET model = '' WHERE user_id = ?").run(row.user_id);
+      cleared += 1;
+    }
+  }
+  // 历史会话的 model 保留（usage 统计需要），仅新会话与发送时校验兜底
+  if (cleared) console.log(`[gateway] 已清理 ${cleared} 个用户的失效默认模型引用`);
+  return cleared;
+}
+
 /**
  * 从供应商上游拉取模型列表，过滤非对话类后持久化（同供应商整体替换）。
  * 返回新增的模型数组；失败抛 GatewayError。
  */
 export async function discoverModels(userId, provider) {
-  const meta = PROVIDER_DEFAULTS[provider];
+  const meta = getProviderMeta(provider);
   if (!meta) throw new GatewayError(`不支持的供应商：${provider}`, 400);
   const { key } = resolveApiKey(userId, provider);
   if (!key) throw new GatewayError(`${meta.name} 的 API Key 未配置，无法获取模型列表`, 400);
@@ -132,7 +237,7 @@ export async function discoverModels(userId, provider) {
     if (!id || id.length > 60 || NON_CHAT_PATTERN.test(id) || builtinIds.has(id)) continue;
     discovered.push({ id, name: prettifyModelName(id), reasoning: /(reason|r1|thinking)/i.test(id), discovered_at: Date.now() });
   }
-  if (!discovered.length) throw new GatewayError(`${meta.name} 未发现可对话的新模型（列表为空或全部已内置）`, 502);
+  if (!discovered.length) throw new GatewayError(`${meta.name} 未发现可对话的新模型（列表为空或均已存在）`, 502);
 
   const stored = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
   stored[provider] = discovered.slice(0, 100); // 防异常响应撑爆设置表
@@ -167,20 +272,19 @@ export function resolveApiKey(userId, provider) {
   const userKeys = parseJsonSafe(settings.api_keys, {});
   const fromUser = userKeys[provider];
   if (fromUser) return { key: fromUser, source: 'user' };
-  const meta = PROVIDER_DEFAULTS[provider];
+  const meta = getProviderMeta(provider);
   if (!meta) return { key: null, source: null };
   const fromPlatform = settingValue(meta.keySetting);
   if (fromPlatform) return { key: fromPlatform, source: 'platform' };
-  const fromEnv = process.env[meta.keyEnv];
-  if (fromEnv) return { key: fromEnv, source: 'env' };
+  if (!meta.custom && meta.keyEnv && process.env[meta.keyEnv]) return { key: process.env[meta.keyEnv], source: 'env' };
   return { key: null, source: null };
 }
 
 export function keyStatus(userId) {
   const out = {};
-  for (const [provider, meta] of Object.entries(PROVIDER_DEFAULTS)) {
-    const { key, source } = resolveApiKey(userId, provider);
-    out[provider] = key ? { configured: true, source, masked: maskKey(key) } : { configured: false, source: null, masked: '' };
+  for (const meta of listProviders()) {
+    const { key, source } = resolveApiKey(userId, meta.id);
+    out[meta.id] = key ? { configured: true, source, masked: maskKey(key) } : { configured: false, source: null, masked: '' };
   }
   return out;
 }
@@ -219,8 +323,9 @@ export function writeSseHead(res) {
  */
 export async function streamChat({ userId, model, messages, signal, onDelta }) {
   const modelInfo = getModel(model);
-  if (!modelInfo) throw new GatewayError(`未知模型：${model}`, 400);
-  const meta = PROVIDER_DEFAULTS[modelInfo.provider];
+  if (!modelInfo) throw new GatewayError(`未知模型：${model}。请先在「设置」页为对应供应商「获取模型列表」`, 400);
+  const meta = getProviderMeta(modelInfo.provider);
+  if (!meta) throw new GatewayError(`模型「${model}」所属供应商已被移除，请重新选择模型`, 400);
   const { key } = resolveApiKey(userId, modelInfo.provider);
   if (!key) {
     throw new GatewayError(
@@ -354,5 +459,5 @@ export function recordUsage({ userId, chatId, model, promptTokens, completionTok
   ).run(userId, chatId || null, model || null, promptTokens || 0, completionTokens || 0, ok ? 1 : 0, Date.now());
 }
 
-export { maskKey, PROVIDER_DEFAULTS };
+export { maskKey, PROVIDER_DEFAULTS, loadCustomProviders };
 export const newAbortError = () => Object.assign(new Error('aborted'), { name: 'AbortError', id: crypto.randomUUID() });

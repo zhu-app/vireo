@@ -21,7 +21,7 @@ export default function Home({ userName, status, onPick }) {
           <div className="hero-hint warn">
             <b>还没有可用的模型 Key。</b>
             请到 <a href="#/settings" onClick={(e) => { e.preventDefault(); navigate('#/settings'); }}>设置</a>
-            {' '}填入你自己的 DeepSeek / OpenAI / 通义千问 API Key，或让管理员配置平台 Key。
+            {' '}填入你自己的 DeepSeek / 通义千问 API Key（或添加自定义供应商），再点「获取模型列表」，或让管理员配置平台 Key。
           </div>
         )}
       </div>

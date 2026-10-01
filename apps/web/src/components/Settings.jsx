@@ -1,11 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../lib/api.js';
 
-const PROVIDERS = [
-  { id: 'deepseek', name: 'DeepSeek', hint: 'platform.deepseek.com 创建，用于 deepseek-chat / reasoner' },
-  { id: 'openai', name: 'OpenAI', hint: 'platform.openai.com 创建，用于 gpt-4o' },
-  { id: 'qwen', name: '通义千问', hint: 'dashscope.console.aliyun.com 创建，用于 qwen-max' },
-];
+const BUILTIN_HINTS = {
+  deepseek: 'platform.deepseek.com 创建',
+  qwen: 'dashscope.console.aliyun.com 创建',
+};
 
 export default function Settings({ status, refreshStatus }) {
   const [keys, setKeys] = useState({});
@@ -15,11 +14,17 @@ export default function Settings({ status, refreshStatus }) {
   const [searchTest, setSearchTest] = useState('');
   const [searchResult, setSearchResult] = useState(null);
   const [models, setModels] = useState([]);
+  const [providers, setProviders] = useState([]);
   const [discoverBusy, setDiscoverBusy] = useState('');
   const [discoverMsg, setDiscoverMsg] = useState('');
+  const [newProvider, setNewProvider] = useState({ name: '', baseUrl: '', key: '' });
+  const [providerBusy, setProviderBusy] = useState(false);
+
+  const isAdmin = status?.user?.role === 'admin';
 
   const loadModels = () => api.models().then(setModels).catch(() => {});
-  useEffect(() => { loadModels(); }, []);
+  const loadProviders = () => api.providers().then(setProviders).catch(() => {});
+  useEffect(() => { loadModels(); loadProviders(); }, []);
 
   async function discover(providerId) {
     setDiscoverBusy(providerId);
@@ -27,7 +32,7 @@ export default function Settings({ status, refreshStatus }) {
     setError('');
     try {
       const r = await api.discoverModels(providerId);
-      setDiscoverMsg(`✓ ${providerId} 已发现 ${r.count} 个可对话模型（${r.models.slice(0, 5).map((m) => m.id).join('、')}${r.count > 5 ? '…' : ''}），已加入对话页下拉框`);
+      setDiscoverMsg(`✓ 已发现 ${r.count} 个可对话模型（${r.models.slice(0, 5).map((m) => m.name).join('、')}${r.count > 5 ? '…' : ''}），已加入对话页下拉框`);
       await loadModels();
       refreshStatus?.();
     } catch (err) {
@@ -38,7 +43,7 @@ export default function Settings({ status, refreshStatus }) {
   }
 
   async function removeModel(id) {
-    if (!window.confirm(`移除动态模型「${id}」？内置模型不受影响。`)) return;
+    if (!window.confirm(`移除模型「${id}」？重新「获取模型列表」可再次导入。`)) return;
     try {
       await api.removeModel(id);
       await loadModels();
@@ -48,19 +53,48 @@ export default function Settings({ status, refreshStatus }) {
     }
   }
 
+  async function addProvider() {
+    const name = newProvider.name.trim();
+    const baseUrl = newProvider.baseUrl.trim();
+    if (!name || !baseUrl) { setError('请填写供应商名称与接口地址'); return; }
+    setProviderBusy(true);
+    setError('');
+    try {
+      await api.addProvider({ name, baseUrl, key: newProvider.key.trim() || undefined });
+      setNewProvider({ name: '', baseUrl: '', key: '' });
+      await loadProviders();
+      refreshStatus?.();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setProviderBusy(false);
+    }
+  }
+
+  async function removeProvider(p) {
+    if (!window.confirm(`删除自定义供应商「${p.name}」？其已发现的模型与平台 Key 将一并移除。`)) return;
+    try {
+      await api.deleteProvider(p.id);
+      await Promise.all([loadProviders(), loadModels()]);
+      refreshStatus?.();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   useEffect(() => {
-    if (status?.keys) setKeys(Object.fromEntries(PROVIDERS.map((p) => [p.id, ''])));
+    if (status?.keys) setKeys(Object.fromEntries((status.providers || []).map((p) => [p.id, ''])));
   }, [status]);
 
   async function saveKeys() {
     const payload = {};
-    for (const p of PROVIDERS) if (keys[p.id]?.trim()) payload[p.id] = keys[p.id].trim();
+    for (const p of providers) if (keys[p.id]?.trim()) payload[p.id] = keys[p.id].trim();
     if (!Object.keys(payload).length) return;
     setBusy(true);
     setError('');
     try {
       await api.saveSettings({ apiKeys: payload });
-      setKeys(Object.fromEntries(PROVIDERS.map((p) => [p.id, ''])));
+      setKeys(Object.fromEntries(providers.map((p) => [p.id, ''])));
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       refreshStatus?.();
@@ -71,20 +105,22 @@ export default function Settings({ status, refreshStatus }) {
     }
   }
 
+  const providerName = (id) => providers.find((p) => p.id === id)?.name || id;
+
   return (
     <div className="page">
       <header className="page-head">
-        <div><h1>设置</h1><p className="muted">模型密钥、联网搜索与账号信息</p></div>
+        <div><h1>设置</h1><p className="muted">模型密钥、供应商、联网搜索与账号信息</p></div>
       </header>
 
       <section className="card">
         <h3>模型 API Key</h3>
-        <p className="muted card-desc">你自己的 Key 只保存在服务端并加密使用，不会下发给其他用户。平台 Key 由管理员配置，个人 Key 优先。</p>
-        {PROVIDERS.map((p) => {
+        <p className="muted card-desc">填入 Key 后点「获取模型列表」拉取该供应商的真实模型，之后即可在对话页选择。你自己的 Key 只保存在服务端，平台 Key 由管理员配置，个人 Key 优先。</p>
+        {providers.map((p) => {
           const info = status?.keys?.[p.id];
           return (
             <div className="key-row" key={p.id}>
-              <div className="key-label"><b>{p.name}</b><i>{p.hint}</i></div>
+              <div className="key-label"><b>{p.name}{p.custom && <em className="tag dyn" style={{ marginLeft: 6 }}>自定义</em>}</b><i>{p.custom ? p.baseUrl : BUILTIN_HINTS[p.id] || p.id}</i></div>
               <div className="key-status">
                 {info?.configured ? (
                   <em className={`kb-status ready`}>已配置{info.source === 'platform' ? '（平台）' : info.source === 'env' ? '（环境）' : ''} {info.masked}</em>
@@ -109,23 +145,51 @@ export default function Settings({ status, refreshStatus }) {
         {error && <div className="page-error">{error}</div>}
         {discoverMsg && <div className="notice ok">{discoverMsg}</div>}
         <div className="row-actions">
-          <button className="btn primary" onClick={saveKeys} disabled={busy || !Object.values(keys).some((v) => v.trim())}>{busy ? '保存中…' : '保存密钥'}</button>
+          <button className="btn primary" onClick={saveKeys} disabled={busy || !Object.values(keys).some((v) => v?.trim())}>{busy ? '保存中…' : '保存密钥'}</button>
           {saved && <span className="saved-tip">✓ 已保存</span>}
         </div>
       </section>
 
+      {isAdmin && (
+        <section className="card">
+          <h3>自定义供应商</h3>
+          <p className="muted card-desc">任何 OpenAI 兼容接口（/v1/chat/completions + /v1/models）都可接入：如 Kimi、智谱 GLM、Ollama、vLLM、企业私有网关等。添加后即可为其填入平台 Key 并「获取模型列表」。</p>
+          <div className="provider-form">
+            <input placeholder="名称（如 Kimi）" value={newProvider.name} onChange={(e) => setNewProvider((v) => ({ ...v, name: e.target.value }))} />
+            <input placeholder="接口地址（如 https://api.moonshot.cn/v1）" value={newProvider.baseUrl} onChange={(e) => setNewProvider((v) => ({ ...v, baseUrl: e.target.value }))} />
+            <input type="password" placeholder="平台 Key（可选）" value={newProvider.key} onChange={(e) => setNewProvider((v) => ({ ...v, key: e.target.value }))} />
+            <button className="btn primary" onClick={addProvider} disabled={providerBusy}>{providerBusy ? '添加中…' : '＋ 添加供应商'}</button>
+          </div>
+          {providers.some((p) => p.custom) && (
+            <ul className="model-list" style={{ marginTop: 12 }}>
+              {providers.filter((p) => p.custom).map((p) => (
+                <li key={p.id}>
+                  <span className="model-name"><b>{p.name}</b><code>{p.baseUrl}</code></span>
+                  <span className="model-prov">{status?.keys?.[p.id]?.configured ? `Key ${status.keys[p.id].masked}` : '无平台 Key（用户可填个人 Key）'}</span>
+                  <button className="icon-btn danger" title="删除该供应商" onClick={() => removeProvider(p)}>×</button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
       <section className="card">
         <h3>可用模型（{models.length}）</h3>
-        <p className="muted card-desc">内置 4 个 + 上游发现的动态模型。「获取模型列表」会拉取该 Key 对应供应商的真实模型清单（已过滤 embedding/语音等非对话模型），发现结果全平台共享。</p>
-        <ul className="model-list">
-          {models.map((m) => (
-            <li key={m.id} className={m.available ? '' : 'unavailable'}>
-              <span className="model-name"><b>{m.name}</b><code>{m.id}</code>{m.reasoning && <em className="tag">思考</em>}{m.vision && <em className="tag">视觉</em>}{m.dynamic && <em className="tag dyn">动态</em>}</span>
-              <span className="model-prov">{PROVIDERS.find((p) => p.id === m.provider)?.name || m.provider}{m.available ? '' : ' · 无 Key 不可用'}</span>
-              {m.dynamic && <button className="icon-btn" title="移除该动态模型" onClick={() => removeModel(m.id)}>×</button>}
-            </li>
-          ))}
-        </ul>
+        <p className="muted card-desc">模型全部来自「获取模型列表」的发现结果（已过滤 embedding/语音等非对话模型），发现一次全平台共享。列表为空时请先配置 Key 并获取。</p>
+        {models.length === 0 ? (
+          <p className="muted">暂无模型 —— 在上方为任一供应商填入 API Key 后点「获取模型列表」。</p>
+        ) : (
+          <ul className="model-list">
+            {models.map((m) => (
+              <li key={m.id} className={m.available ? '' : 'unavailable'}>
+                <span className="model-name"><b>{m.name}</b><code>{m.id}</code>{m.reasoning && <em className="tag">思考</em>}{m.vision && <em className="tag">视觉</em>}</span>
+                <span className="model-prov">{providerName(m.provider)}{m.available ? '' : ' · 无 Key 不可用'}</span>
+                <button className="icon-btn" title="移除该模型" onClick={() => removeModel(m.id)}>×</button>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <section className="card">
@@ -155,8 +219,8 @@ export default function Settings({ status, refreshStatus }) {
         <h3>知识库语义检索</h3>
         <p className="muted card-desc">
           {status?.embedding?.configured
-            ? `已启用（${status.embedding.provider} · ${status.embedding.model}）。新上传的文档会自动生成向量，检索时按「语义 + 关键词」混合排序；此前入库的文件可到知识库页点「↻」重新解析补向量。`
-            : '未启用，知识库当前使用关键词检索。配置任意一个 OpenAI 或通义千问 API Key（本页上方）即自动启用语义检索；也可用 EMBEDDING_PROVIDER / EMBEDDING_MODEL 环境变量指定。'}
+            ? `已启用（${providerName(status.embedding.provider)} · ${status.embedding.model}）。新上传的文档会自动生成向量，检索时按「语义 + 关键词」混合排序；此前入库的文件可到知识库页点「↻」重新解析补向量。`
+            : '未启用，知识库当前使用关键词检索。配置通义千问 Key（自动探测 text-embedding-v3），或添加支持 embeddings 的自定义供应商并设置 EMBEDDING_PROVIDER 指向它。'}
         </p>
       </section>
 

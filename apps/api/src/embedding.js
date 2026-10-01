@@ -3,31 +3,29 @@
  * - 走 OpenAI 兼容 /embeddings 接口，复用 gateway 的密钥解析（个人 Key > 平台 Key > 环境变量）。
  * - 未配置 embedding 模型/Key 时，embedTexts 返回 null —— 调用方安全跳过，检索退化为纯关键词。
  * - 配置项：
- *     EMBEDDING_PROVIDER = openai | qwen | deepseek   （默认取第一个已配置 Key 的供应商）
- *     EMBEDDING_MODEL    = text-embedding-3-small      （openai 默认）/ text-embedding-v3（qwen 默认）
+ *     EMBEDDING_PROVIDER = qwen | 自定义供应商 id   （留空自动探测：qwen → 已配置的自定义供应商）
+ *     EMBEDDING_MODEL    = text-embedding-v3（qwen 默认）/ text-embedding-3-small（其他默认）
  *     UPSTREAM_TIMEOUT_MS 复用 gateway 超时口径
  */
-import { resolveApiKey, PROVIDER_DEFAULTS } from './gateway.js';
+import { resolveApiKey, getProviderMeta, listProviders } from './gateway.js';
 
-const MODEL_DEFAULTS = {
-  openai: 'text-embedding-3-small',
-  qwen: 'text-embedding-v3',
-};
-
-/** 仅显式配置 EMBEDDING_PROVIDER 时允许其他供应商（如兼容网关） */
+const QWEN_MODEL_DEFAULT = 'text-embedding-v3';
 const FALLBACK_MODEL = 'text-embedding-3-small';
 
 export class EmbedError extends Error {}
 
-/** 选择供应商：显式配置优先，否则取第一个有 Key 的 */
+/** 选择供应商：显式配置优先，否则取第一个有 Key 的（qwen 优先，其次自定义） */
 export function embeddingProvider(userId) {
   const explicit = (process.env.EMBEDDING_PROVIDER || '').trim().toLowerCase();
-  const candidates = explicit ? [explicit] : Object.keys(MODEL_DEFAULTS);
+  const candidates = explicit ? [explicit] : ['qwen', ...listProviders().filter((p) => p.custom).map((p) => p.id)];
   for (const provider of candidates) {
-    if (!PROVIDER_DEFAULTS[provider]) continue;
-    if (!explicit && !MODEL_DEFAULTS[provider]) continue; // 自动探测仅走有嵌入接口的供应商
+    const meta = getProviderMeta(provider);
+    if (!meta) continue;
     const { key } = resolveApiKey(userId, provider);
-    if (key) return { provider, key, model: (process.env.EMBEDDING_MODEL || '').trim() || MODEL_DEFAULTS[provider] || FALLBACK_MODEL, baseUrl: PROVIDER_DEFAULTS[provider].baseUrl };
+    if (key) {
+      const defaultModel = provider === 'qwen' ? QWEN_MODEL_DEFAULT : FALLBACK_MODEL;
+      return { provider, key, model: (process.env.EMBEDDING_MODEL || '').trim() || defaultModel, baseUrl: meta.baseUrl };
+    }
   }
   return null;
 }

@@ -1,7 +1,8 @@
 /**
  * API 集成测试：真实启动 Express + SQLite（临时目录），对本地 mock 上游走全链路。
- * 覆盖：健康检查、注册/登录/鉴权、限流、会话与流式对话、重新生成的旧回复保护、
- * 无 Key 失败不丢数据、上传类型白名单、文件下载鉴权（越权 404）、管理端权限。
+ * 覆盖：健康检查、注册/登录/鉴权、限流、模型发现（无内置模型）、自定义供应商 CRUD、
+ * 会话与流式对话、重新生成的旧回复保护、无 Key 失败不丢数据、上传类型白名单、
+ * 文件下载鉴权（越权 404）、语义检索与关键词回退、管理端权限。
  * 运行：npm test -w @vireo/api
  */
 import test from 'node:test';
@@ -22,8 +23,11 @@ process.env.DATA_DIR = tmp;
 process.env.JWT_SECRET = 'test-secret-'.padEnd(48, 'x');
 process.env.DEFAULT_ADMIN_PASSWORD = 'Test-Admin#123';
 process.env.PORT = String(API_PORT);
+// 测试进程内多个用例反复登录，放宽按 IP 的全局阈值；
+// loginLimiter（按 ip+邮箱，10/分钟）保持默认，供限流用例验证
+process.env.AUTH_RATE_MAX = '1000';
 
-// mock 上游：标准 OpenAI 兼容 SSE + 简化 embeddings（含"猫"→[1,0]，否则[0,1]）
+// mock 上游：标准 OpenAI 兼容 SSE + embeddings + 模型列表（含"猫"→[1,0]，否则[0,1]）
 const mockServer = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url.endsWith('/models')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -69,13 +73,13 @@ const mockServer = http.createServer((req, res) => {
 });
 await new Promise((r) => mockServer.listen(MOCK_PORT, '127.0.0.1', r));
 
+// deepseek 供对话；qwen 供 embeddings（语义检索自动探测 qwen）；均指向本地 mock
 process.env.DEEPSEEK_BASE_URL = `http://127.0.0.1:${MOCK_PORT}`;
 process.env.DEEPSEEK_API_KEY = 'mock-key';
-// OPENAI 同样指向 mock：语义检索（embeddings）走本地假上游
-process.env.OPENAI_BASE_URL = `http://127.0.0.1:${MOCK_PORT}`;
-process.env.OPENAI_API_KEY = 'mock-key';
+process.env.QWEN_BASE_URL = `http://127.0.0.1:${MOCK_PORT}`;
+process.env.DASHSCOPE_API_KEY = 'mock-key';
 
-const apiModule = await import('../src/index.js');
+await import('../src/index.js');
 
 async function api(method, url, { body, token, headers = {} } = {}) {
   const h = { ...headers };
@@ -92,6 +96,20 @@ async function register(email) {
   const r = await api('POST', '/api/auth/register', { body: { email, password: 'Password#123', name: '测试员' } });
   assert.equal(r.status, 201, `注册应成功：${r.text}`);
   return r.json.token;
+}
+
+async function streamOnce({ token, chatId, requestId, model, messages, regenerate }) {
+  const res = await fetch(`${BASE}/api/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ chatId, requestId, model, messages, regenerate: regenerate || undefined }),
+  });
+  return res.text();
+}
+
+async function userIdOf(token) {
+  const r = await api('GET', '/api/auth/me', { token });
+  return r.json.user.id;
 }
 
 // ---------- 基础 ----------
@@ -119,19 +137,40 @@ let tokenA;
 let chatId;
 let firstAssistantId;
 
-test('会话与流式对话全链路（mock 上游）', async () => {
+// ---------- 模型发现（无内置模型，全部来自发现） ----------
+test('模型列表初始为空（已移除内置默认模型）', async () => {
   tokenA = await register('a@test.local');
+  const r = await api('GET', '/api/models', { token: tokenA });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.length, 0);
+});
+
+test('未获取模型时创建会话：model 为空，发消息报未知模型', async () => {
   const created = await api('POST', '/api/chats', { token: tokenA, body: {} });
   assert.equal(created.status, 201);
+  assert.equal(created.json.model, '');
   chatId = created.json.id;
+  const sse = await streamOnce({ token: tokenA, chatId, requestId: 'req-empty-01', model: '', messages: [{ role: 'user', content: '你好' }] });
+  assert.match(sse, /"error"/);
+});
 
-  const res = await fetch(`${BASE}/api/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
-    body: JSON.stringify({ chatId, requestId: 'req-e2e-0001', model: 'deepseek-chat', messages: [{ role: 'user', content: '你好' }] }),
-  });
-  assert.equal(res.status, 200);
-  const sse = await res.text();
+test('发现上游模型：过滤非对话类，显示名美化', async () => {
+  const r = await api('POST', '/api/models/discover', { token: tokenA, body: { provider: 'deepseek' } });
+  assert.equal(r.status, 200);
+  // mock 返回 6 个：embedding/dall-e/whisper 被过滤，剩 3 个对话模型
+  assert.equal(r.json.count, 3);
+  assert.deepEqual(r.json.models.map((m) => m.id).sort(), ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash']);
+  const flash = r.json.models.find((m) => m.id === 'deepseek-v4-flash');
+  assert.equal(flash.name, 'DeepSeek V4 Flash', '应美化为友好显示名');
+
+  const list = await api('GET', '/api/models', { token: tokenA });
+  assert.equal(list.json.length, 3);
+  assert.ok(list.json.every((m) => m.dynamic && m.provider === 'deepseek'));
+  assert.ok(list.json.every((m) => m.available), 'deepseek 有 env Key 应可用');
+});
+
+test('会话与流式对话全链路（发现后的模型）', async () => {
+  const sse = await streamOnce({ token: tokenA, chatId, requestId: 'req-e2e-0001', model: 'deepseek-chat', messages: [{ role: 'user', content: '你好' }] });
   assert.match(sse, /"delta"/);
   assert.match(sse, /"done":true/);
 
@@ -143,12 +182,7 @@ test('会话与流式对话全链路（mock 上游）', async () => {
 });
 
 test('重新生成：携带标志且新回复成功后才删除旧回复', async () => {
-  const res = await fetch(`${BASE}/api/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
-    body: JSON.stringify({ chatId, requestId: 'req-e2e-0002', model: 'deepseek-chat', messages: [{ role: 'user', content: '你好' }], regenerate: true }),
-  });
-  const sse = await res.text();
+  const sse = await streamOnce({ token: tokenA, chatId, requestId: 'req-e2e-0002', model: 'deepseek-chat', messages: [{ role: 'user', content: '你好' }], regenerate: true });
   assert.match(sse, /"done":true/);
   assert.match(sse, new RegExp(firstAssistantId), '应返回被删除的旧回复 ID');
 
@@ -160,16 +194,12 @@ test('重新生成：携带标志且新回复成功后才删除旧回复', async
 test('普通连续发消息不删除上一条 AI 回复（丢记录回归）', async () => {
   const before = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
   const prevAssistantId = before.json[before.json.length - 1].id;
-  const res = await fetch(`${BASE}/api/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
-    body: JSON.stringify({ chatId, requestId: 'req-e2e-0004', model: 'deepseek-chat', messages: [
-      { role: 'user', content: '你好' },
-      { role: 'assistant', content: '你好，Vireo 在线' },
-      { role: 'user', content: '再答一次' },
-    ] }),
-  });
-  assert.match(await res.text(), /"done":true/);
+  const sse = await streamOnce({ token: tokenA, chatId, requestId: 'req-e2e-0004', model: 'deepseek-chat', messages: [
+    { role: 'user', content: '你好' },
+    { role: 'assistant', content: '你好，Vireo 在线' },
+    { role: 'user', content: '再答一次' },
+  ] });
+  assert.match(sse, /"done":true/);
   const after = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
   assert.equal(after.json.length, before.json.length + 2, '普通发送应追加 user+assistant，不删除任何历史');
   assert.ok(after.json.some((m) => m.id === prevAssistantId), '上一条 AI 回复必须仍在库中');
@@ -179,19 +209,77 @@ test('模型调用失败时，旧回复必须保留（P0 回归）', async () =>
   const before = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
   const beforeLen = before.json.length;
   const keepId = before.json.at(-1).id;
-  // qwen-max 未配置任何 Key → 应报错，且不得删除已有回复
-  const res = await fetch(`${BASE}/api/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
-    body: JSON.stringify({ chatId, requestId: 'req-e2e-0003', model: 'qwen-max', messages: [{ role: 'user', content: '你好' }] }),
-  });
-  const sse = await res.text();
+  // 未发现的模型 → 报错，且不得删除已有回复
+  const sse = await streamOnce({ token: tokenA, chatId, requestId: 'req-e2e-0003', model: 'ghost-model-x', messages: [{ role: 'user', content: '你好' }] });
   assert.match(sse, /"error"/);
 
   const msgs = await api('GET', `/api/chats/${chatId}/messages`, { token: tokenA });
-  // 失败请求只多落库了这条用户消息；上一条助手回复必须原样保留
-  assert.equal(msgs.json.length, beforeLen + 1, '仅新增用户消息，不删除任何历史');
+  // 未知模型在落库前即被拒绝：消息数不变，历史原样保留
+  assert.equal(msgs.json.length, beforeLen, '无效模型请求不应改动任何消息');
   assert.ok(msgs.json.some((m) => m.id === keepId), '失败后旧助手回复原样保留');
+});
+
+// ---------- 自定义供应商 ----------
+test('自定义供应商：普通用户不可增删，管理员可以', async () => {
+  const denied = await api('POST', '/api/providers', { token: tokenA, body: { name: 'Kimi', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1` } });
+  assert.equal(denied.status, 403);
+
+  const admin = await api('POST', '/api/auth/login', { body: { email: 'admin@local', password: 'Test-Admin#123' } });
+  const created = await api('POST', '/api/providers', { token: admin.json.token, body: { name: 'Kimi Mock', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`, key: 'mock-shared-key' } });
+  assert.equal(created.status, 201);
+  assert.equal(created.json.name, 'Kimi Mock');
+  assert.match(created.json.id, /^kimi-mock/);
+
+  const providers = await api('GET', '/api/providers', { token: tokenA });
+  assert.equal(providers.json.length, 3, 'deepseek + qwen + 自定义');
+  assert.ok(providers.json.some((p) => p.custom && p.name === 'Kimi Mock'));
+});
+
+test('自定义供应商：非法地址与内置同名被拒绝', async () => {
+  const admin = await api('POST', '/api/auth/login', { body: { email: 'admin@local', password: 'Test-Admin#123' } });
+  const badUrl = await api('POST', '/api/providers', { token: admin.json.token, body: { name: 'Bad', baseUrl: 'ftp://nope' } });
+  assert.equal(badUrl.status, 400);
+  const dup = await api('POST', '/api/providers', { token: admin.json.token, body: { name: 'deepseek', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1` } });
+  assert.equal(dup.status, 400);
+});
+
+test('自定义供应商：发现模型并按调用者 Key 标记可用', async () => {
+  const r = await api('POST', '/api/models/discover', { token: tokenA, body: { provider: 'kimi-mock' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.count, 3, '同一 mock 上游返回 3 个对话模型');
+
+  // tokenA 无个人 kimi Key、也无平台 Key 生效路径？平台 Key 已随供应商创建写入 → 应可用
+  const list = await api('GET', '/api/models', { token: tokenA });
+  // 跨供应商同 id 去重：kimi 的 3 个与 deepseek 的 id 相同，列表仍 3 个
+  assert.equal(list.json.length, 3);
+  const status = await api('GET', '/api/status', { token: tokenA });
+  assert.equal(status.json.keys['kimi-mock'].configured, true, '平台 Key 对所有用户生效');
+});
+
+test('自定义供应商：删除后模型与 Key 一并清理', async () => {
+  const admin = await api('POST', '/api/auth/login', { body: { email: 'admin@local', password: 'Test-Admin#123' } });
+  const del = await api('DELETE', '/api/providers/kimi-mock', { token: admin.json.token });
+  assert.equal(del.status, 200);
+  const providers = await api('GET', '/api/providers', { token: tokenA });
+  assert.equal(providers.json.length, 2);
+  const status = await api('GET', '/api/status', { token: tokenA });
+  assert.equal(status.json.keys['kimi-mock'], undefined);
+  // 指向已删除供应商的个人 Key 被拒绝
+  const badKey = await api('PUT', '/api/settings', { token: tokenA, body: { apiKeys: { 'kimi-mock': 'sk-x' } } });
+  assert.equal(badKey.status, 400);
+});
+
+test('内置供应商不可删除', async () => {
+  const admin = await api('POST', '/api/auth/login', { body: { email: 'admin@local', password: 'Test-Admin#123' } });
+  const del = await api('DELETE', '/api/providers/deepseek', { token: admin.json.token });
+  assert.equal(del.status, 400);
+});
+
+test('模型可移除（现无内置模型，全部来自发现）', async () => {
+  const removed = await api('DELETE', '/api/models/deepseek-v4-flash', { token: tokenA });
+  assert.equal(removed.status, 200);
+  const list = await api('GET', '/api/models', { token: tokenA });
+  assert.equal(list.json.length, 2, '移除后剩 chat 与 reasoner');
 });
 
 test('登录限流：同一邮箱高频尝试返回 429', async () => {
@@ -249,7 +337,7 @@ test('旧的无鉴权 /uploads 路径已不存在', async () => {
   assert.ok(r.status === 404 || r.status === 401, `不应可访问：${r.status}`);
 });
 
-// ---------- 语义检索（向量落库 + 混合召回） ----------
+// ---------- 语义检索（向量落库 + 混合召回，embeddings 走 qwen→mock） ----------
 const waitFor = async (fn, ms = 8000) => {
   const start = Date.now();
   while (Date.now() - start < ms) {
@@ -292,19 +380,9 @@ test('检索走混合模式：语义召回关键词命不中的表述', async ()
   assert.equal(hits[0].fileName, 'kb-cat.txt');
 });
 
-async function userIdOf(token) {
-  const r = await api('GET', '/api/auth/me', { token });
-  return r.json.user.id;
-}
-
 test('对话链路的 kb 引用标注为混合检索', async () => {
   await api('PUT', '/api/settings', { token: tokenA, body: { kbIds: [catFileId, dogFileId] } });
-  const res = await fetch(`${BASE}/api/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
-    body: JSON.stringify({ chatId, requestId: 'req-kb-0001', model: 'deepseek-chat', messages: [{ role: 'user', content: '猫' }] }),
-  });
-  const sse = await res.text();
+  const sse = await streamOnce({ token: tokenA, chatId, requestId: 'req-kb-0001', model: 'deepseek-chat', messages: [{ role: 'user', content: '猫' }] });
   assert.match(sse, /"type":"kb"/);
   assert.match(sse, /"via":"hybrid"/);
   assert.match(sse, /kb-cat\.txt/);
@@ -312,73 +390,16 @@ test('对话链路的 kb 引用标注为混合检索', async () => {
 
 test('未配置嵌入服务时回退关键词检索', async () => {
   const { retrieveChunks } = await import('../src/kb.js');
-  const savedKey = process.env.OPENAI_API_KEY;
-  delete process.env.OPENAI_API_KEY; // tokenA 无个人 Key，openai 环境变量清空后语义分支不可用
+  const savedKey = process.env.DASHSCOPE_API_KEY;
+  delete process.env.DASHSCOPE_API_KEY; // qwen 无 Key 且无自定义供应商 → 语义分支不可用
   try {
     const uid = await userIdOf(tokenA);
     const hits = await retrieveChunks(uid, '晒太阳 窗台', [catFileId, dogFileId], 5);
     assert.ok(hits.length >= 1, '关键词回退应仍能召回');
     assert.ok(hits.every((h) => h.via === 'keyword'), '回退结果必须全部为 keyword');
   } finally {
-    if (savedKey) process.env.OPENAI_API_KEY = savedKey;
+    if (savedKey) process.env.DASHSCOPE_API_KEY = savedKey;
   }
-});
-
-// ---------- 模型发现（动态模型列表） ----------
-test('模型列表初始为内置 4 个', async () => {
-  const r = await api('GET', '/api/models', { token: tokenA });
-  assert.equal(r.status, 200);
-  assert.equal(r.json.length, 4);
-  assert.ok(r.json.every((m) => !m.dynamic));
-});
-
-test('发现上游模型：过滤非对话类与内置项', async () => {
-  const r = await api('POST', '/api/models/discover', { token: tokenA, body: { provider: 'deepseek' } });
-  assert.equal(r.status, 200);
-  // mock 返回 6 个：2 内置重复 + embedding/dall-e/whisper 被过滤，仅剩 deepseek-v4-flash
-  assert.equal(r.json.count, 1);
-  assert.equal(r.json.models[0].id, 'deepseek-v4-flash');
-  assert.equal(r.json.models[0].name, 'DeepSeek V4 Flash', '应美化为友好显示名');
-
-  const list = await api('GET', '/api/models', { token: tokenA });
-  assert.equal(list.json.length, 5, '内置 4 + 动态 1');
-  const dyn = list.json.find((m) => m.id === 'deepseek-v4-flash');
-  assert.equal(dyn.dynamic, true);
-  assert.equal(dyn.provider, 'deepseek');
-  assert.equal(dyn.available, true, 'deepseek 有 env Key 应可用');
-});
-
-test('发现的动态模型可直接发起对话', async () => {
-  const res = await fetch(`${BASE}/api/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
-    body: JSON.stringify({ chatId, requestId: 'req-dyn-0001', model: 'deepseek-v4-flash', messages: [{ role: 'user', content: '动态模型测试' }] }),
-  });
-  const sse = await res.text();
-  assert.match(sse, /"done":true/);
-  assert.doesNotMatch(sse, /"error"/);
-});
-
-test('未配 Key 的供应商发现返回 400', async () => {
-  const savedQwen = process.env.DASHSCOPE_API_KEY;
-  delete process.env.DASHSCOPE_API_KEY;
-  try {
-    const r = await api('POST', '/api/models/discover', { token: tokenA, body: { provider: 'qwen' } });
-    assert.equal(r.status, 400);
-    assert.match(r.json.error, /未配置/);
-  } finally {
-    if (savedQwen) process.env.DASHSCOPE_API_KEY = savedQwen;
-  }
-});
-
-test('内置模型不可移除，动态模型可移除', async () => {
-  const builtin = await api('DELETE', '/api/models/deepseek-chat', { token: tokenA });
-  assert.equal(builtin.status, 400);
-
-  const removed = await api('DELETE', '/api/models/deepseek-v4-flash', { token: tokenA });
-  assert.equal(removed.status, 200);
-  const list = await api('GET', '/api/models', { token: tokenA });
-  assert.equal(list.json.length, 4, '移除后回到内置 4 个');
 });
 
 // ---------- 管理端 ----------

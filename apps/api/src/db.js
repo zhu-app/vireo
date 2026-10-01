@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS chats (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   title TEXT NOT NULL,
-  model TEXT NOT NULL DEFAULT 'deepseek-chat',
+  model TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_user ON kb_chunks(user_id, file_id);
 CREATE TABLE IF NOT EXISTS settings (
   user_id TEXT PRIMARY KEY,
-  model TEXT NOT NULL DEFAULT 'deepseek-chat',
+  model TEXT NOT NULL DEFAULT '',
   search_enabled INTEGER NOT NULL DEFAULT 0,
   kb_ids TEXT NOT NULL DEFAULT '[]',
   api_keys TEXT NOT NULL DEFAULT '{}',
@@ -104,7 +104,7 @@ for (const ddl of [
 }
 
 const defaultSettings = {
-  model: 'deepseek-chat',
+  model: '',
   search_enabled: 0,
   kb_ids: '[]',
   api_keys: '{}',

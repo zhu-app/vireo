@@ -528,6 +528,8 @@ a:hover { text-decoration: underline; }
 
 /* 可用模型列表 */
 .model-list { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
+.provider-form { display: grid; grid-template-columns: 1fr 1.6fr 1fr auto; gap: 8px; align-items: center; margin-top: 8px; }
+@media (max-width: 720px) { .provider-form { grid-template-columns: 1fr; } }
 .model-list li {
   display: flex; align-items: center; gap: 10px; font-size: 13px;
   background: var(--bg-sunken); border-radius: var(--radius-s); padding: 7px 12px;

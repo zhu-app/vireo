@@ -11,7 +11,6 @@ services:
       # 不再内置弱默认值：首次部署必须显式设置管理员密码，否则按缺失处理不落库
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?请在 infra/.env 中设置 DEFAULT_ADMIN_PASSWORD}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       SEARCH_API_KEY: ${SEARCH_API_KEY:-}
     volumes:

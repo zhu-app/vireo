@@ -6,6 +6,7 @@ export default function Admin() {
   const [stats, setStats] = useState(null);
   const [users, setUsers] = useState([]);
   const [keys, setKeys] = useState({});
+  const [providers, setProviders] = useState([]);
   const [input, setInput] = useState({});
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
@@ -14,6 +15,7 @@ export default function Admin() {
     api.adminStats().then(setStats).catch((e) => setError(e.message));
     api.adminUsers().then(setUsers).catch((e) => setError(e.message));
     api.adminKeys().then(setKeys).catch((e) => setError(e.message));
+    api.providers().then(setProviders).catch(() => {});
   }, []);
 
   async function patchUser(id, body) {
@@ -123,9 +125,11 @@ export default function Admin() {
       {tab === 'keys' && (
         <section className="card">
           <p className="muted card-desc">平台级密钥对所有用户生效（用户个人 Key 优先）。用于不暴露个人 Key 的团队/产品部署。</p>
-          {Object.entries(keys).map(([p, info]) => (
+          {Object.entries(keys).map(([p, info]) => {
+            const prov = providers.find((x) => x.id === p);
+            return (
             <div className="key-row" key={p}>
-              <div className="key-label"><b>{{ deepseek: 'DeepSeek', openai: 'OpenAI', qwen: '通义千问', search: '搜索服务（Tavily）' }[p] || p}</b></div>
+              <div className="key-label"><b>{p === 'search' ? '搜索服务（Tavily）' : prov?.name || p}</b>{prov?.custom && <i>{prov.baseUrl}</i>}</div>
               <div className="key-status">
                 {info?.configured ? <em className="kb-status ready">已配置 {info.masked}</em> : <em className="kb-status failed">未配置</em>}
               </div>
@@ -136,7 +140,8 @@ export default function Admin() {
                 onChange={(e) => setInput((s) => ({ ...s, [p]: e.target.value }))}
               />
             </div>
-          ))}
+            );
+          })}
           <div className="row-actions">
             <button className="btn primary" onClick={saveKeys}>保存平台密钥</button>
             {saved && <span className="saved-tip">✓ 已保存</span>}

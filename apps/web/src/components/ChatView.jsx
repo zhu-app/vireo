@@ -3,8 +3,6 @@ import { navigate } from '../lib/router.js';
 import { api, streamChat } from '../lib/api.js';
 import { Markdown } from '../markdown.jsx';
 
-const PROVIDER_NAMES = { deepseek: 'DeepSeek', openai: 'OpenAI', qwen: '通义千问' };
-
 function Notice({ notice }) {
   if (notice.type === 'kb') {
     return <div className="notice"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20V4H6.5A2.5 2.5 0 004 6.5v13z" /></svg>已参考知识库{notice.via === 'hybrid' ? '（语义+关键词）' : ''}：{notice.files.join('、')}（{notice.count} 个片段）</div>;
@@ -74,7 +72,7 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
-  const [model, setModel] = useState(chat.model || status?.model || 'deepseek-chat');
+  const [model, setModel] = useState(chat.model || status?.model || '');
   const [streamError, setStreamError] = useState('');
   const [searchOn, setSearchOn] = useState(Boolean(status?.searchEnabled));
   const streamRef = useRef(null);
@@ -123,6 +121,12 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
 
   const modelOptions = (status?.models || models || []).filter((m) => m.available);
   const currentModel = (status?.models || models || []).find((m) => m.id === model);
+  // 无选中模型、或所选模型已不可用（被移除/供应商删除）时，自动切到第一个可用模型
+  useEffect(() => {
+    if (modelOptions.length && !modelOptions.some((m) => m.id === model)) setModel(modelOptions[0].id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelOptions.map((m) => m.id).join(','), model]);
+  const providerLabel = (id) => (status?.providers || []).find((p) => p.id === id)?.name || ({ deepseek: 'DeepSeek', qwen: '通义千问' }[id] || id);
 
   function buildHistory(list) {
     return list.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content }));
@@ -234,15 +238,16 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
             }} />
             <span>联网</span>
           </label>
-          <select className="model-select" value={model} onChange={(e) => setModel(e.target.value)} title="当前模型">
+          <select className="model-select" value={modelOptions.some((m) => m.id === model) ? model : ''} onChange={(e) => setModel(e.target.value)} title="当前模型">
+            {modelOptions.length === 0 && <option value="">无可用模型 · 去设置获取</option>}
             {Object.entries(
-              (modelOptions.length ? modelOptions : [currentModel || { id: model, name: model, provider: 'deepseek' }]).reduce((groups, m) => {
+              modelOptions.reduce((groups, m) => {
                 const key = m.provider || 'other';
                 (groups[key] ||= []).push(m);
                 return groups;
               }, {})
             ).map(([provider, list]) => (
-              <optgroup key={provider} label={PROVIDER_NAMES[provider] || provider}>
+              <optgroup key={provider} label={providerLabel(provider)}>
                 {list.map((m) => (
                   <option key={m.id} value={m.id}>{m.name}{m.reasoning ? ' · 思考' : ''}</option>
                 ))}

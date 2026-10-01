@@ -31,6 +31,13 @@ import {
   maskKey,
   discoverModels,
   removeDynamicModel,
+  listProviders,
+  getProviderMeta,
+  addProvider,
+  updateProvider,
+  deleteProvider,
+  ProviderError,
+  migrateStaleModelRefs,
   PROVIDER_DEFAULTS,
 } from './gateway.js';
 import { isSupported, ingestFile, retrieveChunks, buildKbContext, deleteFileArtifacts } from './kb.js';
@@ -41,6 +48,7 @@ import { rateLimit } from './ratelimit.js';
 const app = express();
 const port = Number(process.env.PORT || 8080);
 seedAdmin(hashPassword);
+migrateStaleModelRefs();
 
 app.set('trust proxy', 1); // Nginx 反代下取真实 IP，供限流与日志使用
 
@@ -87,10 +95,13 @@ const Z = {
     model: z.string().max(60).optional(),
     searchEnabled: z.boolean().optional(),
     kbIds: z.array(z.string()).max(50).optional(),
-    apiKeys: z.record(z.enum(['deepseek', 'openai', 'qwen']), z.string().max(200)).optional(),
+    // 供应商 id 合法性在路由内用 getProviderMeta 校验（内置 + 自定义动态变化，不用枚举）
+    apiKeys: z.record(z.string().min(1).max(40), z.string().max(200)).optional(),
   }),
+  provider: z.object({ name: z.string().trim().min(1).max(40), baseUrl: z.string().trim().min(10).max(300), key: z.string().max(200).optional() }),
+  providerUpdate: z.object({ name: z.string().trim().min(1).max(40).optional(), baseUrl: z.string().trim().min(10).max(300).optional(), key: z.string().max(200).optional() }),
   adminUser: z.object({ disabled: z.boolean().optional(), dailyLimit: z.number().int().min(0).max(1000000).optional(), name: z.string().trim().min(1).max(40).optional() }),
-  adminKeys: z.record(z.enum(Object.keys(PROVIDER_DEFAULTS).concat(['search'])), z.string().max(200)).optional(),
+  adminKeys: z.record(z.string().min(1).max(40), z.string().max(200)).optional(),
 };
 
 function validate(schema, data, res) {
@@ -157,10 +168,50 @@ api.get('/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) })
 // ---------- 模型与状态 ----------
 api.get('/models', auth, (req, res) => res.json(listModels().map((m) => ({ ...m, available: Boolean(resolveApiKey(req.user.id, m.provider).key) }))));
 
+// 供应商列表（内置 + 自定义），前端渲染密钥行与下拉分组
+api.get('/providers', auth, (_, res) => res.json(listProviders()));
+
+function handleProviderError(res, error) {
+  if (error instanceof ProviderError) return res.status(error.status).json({ error: error.message });
+  console.error('[providers] unexpected error:', error?.message || error);
+  res.status(500).json({ error: '供应商操作失败，请稍后再试' });
+}
+
+// 自定义供应商仅管理员可增删改（其平台 Key 全用户共享）
+api.post('/providers', auth, adminOnly, (req, res) => {
+  const body = validate(Z.provider, req.body || {}, res);
+  if (!body) return;
+  try {
+    res.status(201).json(addProvider(body));
+  } catch (error) {
+    handleProviderError(res, error);
+  }
+});
+
+api.patch('/providers/:id', auth, adminOnly, (req, res) => {
+  const body = validate(Z.providerUpdate, req.body || {}, res);
+  if (!body) return;
+  try {
+    res.json(updateProvider(req.params.id, body));
+  } catch (error) {
+    handleProviderError(res, error);
+  }
+});
+
+api.delete('/providers/:id', auth, adminOnly, (req, res) => {
+  if (PROVIDER_DEFAULTS[req.params.id]) return res.status(400).json({ error: '内置供应商不可删除' });
+  try {
+    deleteProvider(req.params.id);
+    res.json({ ok: true });
+  } catch (error) {
+    handleProviderError(res, error);
+  }
+});
+
 // 从上游拉取真实模型列表（过滤非对话类），持久化后全平台共享
 api.post('/models/discover', auth, rateLimit({ windowMs: 60_000, max: 5, message: '获取模型列表过于频繁，请稍后再试' }), async (req, res) => {
-  const provider = z.enum(['deepseek', 'openai', 'qwen']).safeParse(req.body?.provider);
-  if (!provider.success) return res.status(400).json({ error: '请指定供应商（deepseek / openai / qwen）' });
+  const provider = z.string().min(1).max(40).safeParse(req.body?.provider);
+  if (!provider.success || !getProviderMeta(provider.data)) return res.status(400).json({ error: '请指定有效的供应商' });
   try {
     const discovered = await discoverModels(req.user.id, provider.data);
     res.json({ count: discovered.length, models: discovered });
@@ -181,6 +232,7 @@ api.get('/status', auth, (req, res) => {
   const settings = getSettings(req.user.id);
   res.json({
     keys: keyStatus(req.user.id),
+    providers: listProviders(),
     search: searchStatus(),
     embedding: embeddingStatus(req.user.id),
     models: listModels().map((m) => ({ ...m, available: Boolean(resolveApiKey(req.user.id, m.provider).key) })),
@@ -207,7 +259,7 @@ api.post('/chats', auth, (req, res) => {
     id: newId(),
     user_id: req.user.id,
     title: body.title?.trim() || '新对话',
-    model: body.model || settings.model || 'deepseek-chat',
+    model: body.model || settings.model || '',
     created_at: Date.now(),
     updated_at: Date.now(),
   };
@@ -352,10 +404,15 @@ api.put('/settings', auth, (req, res) => {
     const current = parseJsonSafe(getSettings(req.user.id).api_keys, {});
     const next = { ...current };
     for (const [provider, key] of Object.entries(body.apiKeys)) {
+      if (!getProviderMeta(provider)) return res.status(400).json({ error: `供应商不存在：${provider}` });
       const trimmed = String(key || '').trim();
       if (trimmed === '') delete next[provider];
       else if (trimmed.includes('*')) continue; // 前端回显的掩码，忽略
       else next[provider] = trimmed;
+    }
+    // 清理指向已删除自定义供应商的旧 Key
+    for (const provider of Object.keys(next)) {
+      if (!getProviderMeta(provider)) delete next[provider];
     }
     patch.apiKeys = JSON.stringify(next);
   }
@@ -561,9 +618,9 @@ admin.patch('/users/:id', (req, res) => {
 
 admin.get('/keys', (_, res) => {
   const out = {};
-  for (const [provider, meta] of Object.entries(PROVIDER_DEFAULTS)) {
+  for (const meta of listProviders()) {
     const value = settingValue(meta.keySetting);
-    out[provider] = value ? { configured: true, masked: maskKey(value) } : { configured: false, masked: '' };
+    out[meta.id] = value ? { configured: true, masked: maskKey(value) } : { configured: false, masked: '' };
   }
   const searchKey = settingValue('platform_search_key') || process.env.SEARCH_API_KEY;
   out.search = searchKey ? { configured: true, masked: maskKey(searchKey) } : { configured: false, masked: '' };
@@ -576,14 +633,13 @@ admin.put('/keys', (req, res) => {
   for (const [provider, key] of Object.entries(body)) {
     const trimmed = String(key || '').trim();
     if (trimmed.includes('*')) continue;
-    if (trimmed === '') {
-      if (provider === 'search') setSettingValue('platform_search_key', null);
-      else setSettingValue(PROVIDER_DEFAULTS[provider].keySetting, null);
-    } else if (provider === 'search') {
-      setSettingValue('platform_search_key', trimmed);
-    } else {
-      setSettingValue(PROVIDER_DEFAULTS[provider].keySetting, trimmed);
+    if (provider === 'search') {
+      setSettingValue('platform_search_key', trimmed || null);
+      continue;
     }
+    const meta = getProviderMeta(provider);
+    if (!meta) return res.status(400).json({ error: `供应商不存在：${provider}` });
+    setSettingValue(meta.keySetting, trimmed || null);
   }
   res.json({ ok: true });
 });
