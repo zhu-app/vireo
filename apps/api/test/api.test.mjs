@@ -480,6 +480,123 @@ test('删除会话：附件及其分块连带清理', async () => {
   assert.equal(db.prepare('SELECT COUNT(*) n FROM kb_chunks WHERE file_id = ?').get(attFileId).n, 0, '附件分块应删除');
 });
 
+// ---------- 账号体系：改密 / 注销 / 强度 / 锁定 ----------
+test('注册密码强度：无数字或过短被拒绝', async () => {
+  const noDigit = await api('POST', '/api/auth/register', { body: { email: 'weak1@test.local', password: 'alllowercase' } });
+  assert.equal(noDigit.status, 400);
+  assert.match(noDigit.json.error, /字母和数字/);
+  const tooShort = await api('POST', '/api/auth/register', { body: { email: 'weak2@test.local', password: 'ab1' } });
+  assert.equal(tooShort.status, 400);
+});
+
+test('修改密码：旧密码错误被拒；成功后旧 token 失效、新 token 可用', async () => {
+  const token = await register('pw@test.local');
+  const wrong = await api('POST', '/api/auth/password', { token, body: { currentPassword: 'wrong-pass-1', newPassword: 'NewPass#456' } });
+  assert.equal(wrong.status, 401, '旧密码不对应拒绝');
+
+  const same = await api('POST', '/api/auth/password', { token, body: { currentPassword: 'Password#123', newPassword: 'Password#123' } });
+  assert.equal(same.status, 400, '新旧密码相同应拒绝');
+
+  const weak = await api('POST', '/api/auth/password', { token, body: { currentPassword: 'Password#123', newPassword: 'onlyletters' } });
+  assert.equal(weak.status, 400, '新密码需过强度校验');
+
+  const ok = await api('POST', '/api/auth/password', { token, body: { currentPassword: 'Password#123', newPassword: 'NewPass#456' } });
+  assert.equal(ok.status, 200);
+  assert.ok(ok.json.token, '改密成功应换发新 token');
+
+  const oldDead = await api('GET', '/api/auth/me', { token });
+  assert.equal(oldDead.status, 401, '改密后旧 token 必须失效');
+  const newAlive = await api('GET', '/api/auth/me', { token: ok.json.token });
+  assert.equal(newAlive.status, 200, '新 token 应可用');
+
+  const relogin = await api('POST', '/api/auth/login', { body: { email: 'pw@test.local', password: 'NewPass#456' } });
+  assert.equal(relogin.status, 200, '应可用新密码登录');
+});
+
+test('登录失败锁定：连续 5 次错误后账号临时锁定，正确密码也被拒', async () => {
+  await register('lock@test.local');
+  let last;
+  for (let i = 0; i < 5; i += 1) {
+    last = await api('POST', '/api/auth/login', { body: { email: 'lock@test.local', password: `bad${i}pass` } });
+    if (i < 4) assert.equal(last.status, 401, `第 ${i + 1} 次错误应为 401`);
+  }
+  assert.equal(last.status, 423, '第 5 次错误应触发账号锁定');
+  const evenRight = await api('POST', '/api/auth/login', { body: { email: 'lock@test.local', password: 'Password#123' } });
+  assert.equal(evenRight.status, 423, '锁定期内正确密码也被拒');
+});
+
+test('注销账号：密码校验 + 级联删除全部数据 + 旧 token 失效', async () => {
+  const token = await register('del@test.local');
+  const userId = await userIdOf(token);
+  const chat = await api('POST', '/api/chats', { token, body: { title: '将随注销删除' } });
+  assert.equal(chat.status, 201);
+
+  const badPwd = await api('DELETE', '/api/auth/me', { token, body: { password: 'wrong-pass-1' } });
+  assert.equal(badPwd.status, 401, '密码不对不允许注销');
+  const weakBody = await api('DELETE', '/api/auth/me', { token, body: {} });
+  assert.equal(weakBody.status, 400, '缺少密码字段应 400');
+
+  const gone = await api('DELETE', '/api/auth/me', { token, body: { password: 'Password#123' } });
+  assert.equal(gone.status, 200);
+
+  const { default: db } = await import('../src/db.js');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM users WHERE email = ?').get('del@test.local').n, 0, '用户行应删除');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM chats WHERE id = ?').get(chat.json.id).n, 0, '会话应级联删除');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM settings WHERE user_id = ?').get(userId).n, 0, '个人设置应删除');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM usage WHERE user_id = ?').get(userId).n, 0, '用量记录应删除');
+
+  const after = await api('GET', '/api/auth/me', { token });
+  assert.equal(after.status, 401, '注销后 token 必须失效');
+});
+
+test('管理员账号不允许自助注销', async () => {
+  const admin = await api('POST', '/api/auth/login', { body: { email: 'admin@local', password: 'Test-Admin#123' } });
+  assert.equal(admin.status, 200);
+  const del = await api('DELETE', '/api/auth/me', { token: admin.json.token, body: { password: 'Test-Admin#123' } });
+  assert.equal(del.status, 400, '管理员自助注销应被拒绝');
+});
+
+// ---------- 缺陷回归：体积上限对齐 + 重启自愈 ----------
+test('上传：超过 5MB 被拒（上传上限与解析上限一致）', async () => {
+  // 5MB + 1 字节的文本文件，应在 multer 层直接拒绝，而非入库后解析失败
+  const big = 'a'.repeat(5 * 1024 * 1024 + 1);
+  const mp = multipart([{ name: 'big.txt', type: 'text/plain', data: big }]);
+  const r = await api('POST', '/api/files', { token: tokenA, body: mp.body, headers: mp.headers });
+  assert.equal(r.status, 400);
+  assert.match(r.json.error, /5MB/, `报错应提示 5MB 上限：${r.json.error}`);
+});
+
+test('重启自愈：pending 僵尸文件被重新解析为 ready 或 unsupported', async () => {
+  const { requeuePendingFiles } = await import('../src/index.js');
+  const { default: dbCore } = await import('../src/db.js');
+  const { randomUUID } = await import('node:crypto');
+  const fsMod = await import('node:fs');
+  const pathMod = await import('node:path');
+  const uid = await userIdOf(tokenA);
+
+  // 场景 A：受支持但卡在 pending 的行（模拟解析中途崩溃）→ 自愈后应变 ready
+  const okId = randomUUID();
+  const okName = `zombie-${okId}.txt`;
+  const uploadDir = pathMod.join(process.env.DATA_DIR, 'uploads');
+  fsMod.mkdirSync(uploadDir, { recursive: true });
+  fsMod.writeFileSync(pathMod.join(uploadDir, okName), '自愈测试：猫在窗台晒太阳，呼噜声很治愈。');
+  dbCore.prepare("INSERT INTO files (id, user_id, name, mime, size, path, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)").run(okId, uid, okName, 'text/plain', 40, `/uploads/${okName}`, Date.now());
+
+  // 场景 B：不受支持格式且卡 pending → 自愈后应转 unsupported
+  const badId = randomUUID();
+  dbCore.prepare("INSERT INTO files (id, user_id, name, mime, size, path, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)").run(badId, uid, `zombie-${badId}.exe`, 'application/octet-stream', 10, '/uploads/none.exe', Date.now());
+
+  const requeued = requeuePendingFiles();
+  assert.ok(requeued >= 2, `本次应至少回收 2 个 pending 行，实际 ${requeued}`);
+
+  // 场景 B 走同步分支，立即变 unsupported
+  assert.equal(dbCore.prepare('SELECT status FROM files WHERE id = ?').get(badId).status, 'unsupported', '不支持格式应转 unsupported');
+
+  // 场景 A 走异步 ingestFile，轮询等待其解析完成
+  const ready = await waitFor(async () => dbCore.prepare('SELECT status FROM files WHERE id = ?').get(okId).status === 'ready');
+  assert.ok(ready, '受支持的 pending 文件应被自愈解析为 ready');
+});
+
 test('cleanup', async () => {
   const { server } = await import('../src/index.js');
   server.close();

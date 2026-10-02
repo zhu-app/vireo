@@ -7,7 +7,8 @@ import { estimateTokens } from './gateway.js';
 import { embedTexts, packVector, unpackVector, cosine, EmbedError } from './embedding.js';
 
 const TEXT_EXT = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.log', '.xml', '.yml', '.yaml']);
-const MAX_FILE_BYTES = 5 * 1024 * 1024; // 解析上限 5MB
+// 解析上限 5MB：导出给上传层做同口径限制，避免"传得进来、解析不了"
+export const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const CHUNK_TARGET = 600; // 每块目标 token
 const CHUNK_OVERLAP = 80;
 

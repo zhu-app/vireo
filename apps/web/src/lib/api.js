@@ -51,6 +51,13 @@ export const api = {
   register: (body) => request('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }),
   login: (body) => request('/api/auth/login', { method: 'POST', body: JSON.stringify(body) }),
   me: () => request('/api/auth/me'),
+  // 改密后旧 token 即失效，后端换发新 token：写入本地会话，当前页面免重新登录
+  changePassword: async (body) => {
+    const r = await request('/api/auth/password', { method: 'POST', body: JSON.stringify(body) });
+    if (r?.token) localStorage.setItem('vireo-token', r.token);
+    return r;
+  },
+  closeAccount: (password) => request('/api/auth/me', { method: 'DELETE', body: JSON.stringify({ password }) }),
   models: () => request('/api/models'),
   providers: () => request('/api/providers'),
   addProvider: (body) => request('/api/providers', { method: 'POST', body: JSON.stringify(body) }),

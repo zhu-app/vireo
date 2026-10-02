@@ -26,7 +26,8 @@ export function verifyPassword(password, stored) {
 }
 
 export function signToken(user) {
-  return jwt.sign({ id: user.id, role: user.role }, secret, { expiresIn: '7d' });
+  // pwd：改密时间戳。auth 中间件与库中当前值比对——修改密码后所有旧 token 立即失效
+  return jwt.sign({ id: user.id, role: user.role, pwd: Number(user.pwd_changed_at || 0) }, secret, { expiresIn: '7d' });
 }
 
 export function publicUser(user) {
@@ -50,6 +51,10 @@ export function auth(req, res, next) {
   }
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.id);
   if (!user) return res.status(401).json({ error: '账号不存在，请重新登录' });
+  // 密码修改后旧 token 一律失效（payload.pwd 与库中当前值不一致）
+  if (Number(user.pwd_changed_at || 0) !== Number(payload.pwd || 0)) {
+    return res.status(401).json({ error: '密码已变更，请重新登录' });
+  }
   if (user.disabled) return res.status(403).json({ error: '该账号已被停用，请联系管理员' });
   req.user = user;
   next();

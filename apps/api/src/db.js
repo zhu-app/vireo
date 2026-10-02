@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL DEFAULT 'user',
   daily_limit INTEGER NOT NULL DEFAULT 50,
   disabled INTEGER NOT NULL DEFAULT 0,
+  pwd_changed_at INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS chats (
@@ -97,6 +98,7 @@ for (const ddl of [
   'ALTER TABLE kb_chunks ADD COLUMN vec_dim INTEGER',
   'ALTER TABLE kb_chunks ADD COLUMN embedding_model TEXT',
   'ALTER TABLE files ADD COLUMN chat_id TEXT',
+  'ALTER TABLE users ADD COLUMN pwd_changed_at INTEGER NOT NULL DEFAULT 0',
 ]) {
   try {
     db.exec(ddl);

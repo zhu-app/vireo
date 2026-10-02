@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { api } from '../lib/api.js';
+import { api, clearSession } from '../lib/api.js';
 
 const BUILTIN_HINTS = {
   deepseek: 'platform.deepseek.com 创建',
@@ -21,6 +21,10 @@ export default function Settings({ status, refreshStatus }) {
   const [providerBusy, setProviderBusy] = useState(false);
   const [manual, setManual] = useState({ provider: '', modelId: '' });
   const [manualBusy, setManualBusy] = useState(false);
+  const [pwd, setPwd] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
+  const [pwdBusy, setPwdBusy] = useState(false);
+  const [pwdDone, setPwdDone] = useState(false);
+  const [closeBusy, setCloseBusy] = useState(false);
 
   const isAdmin = status?.user?.role === 'admin';
 
@@ -136,6 +140,48 @@ export default function Settings({ status, refreshStatus }) {
       refreshStatus?.();
     } catch (err) {
       setError(err.message);
+    }
+  }
+
+  // ---- 修改密码 / 注销账号 ----
+  async function submitPassword() {
+    setError('');
+    const { currentPassword, newPassword, confirmPassword } = pwd;
+    if (!currentPassword || !newPassword) { setError('请填写当前密码与新密码'); return; }
+    if (newPassword.length < 8 || !/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword)) {
+      setError('新密码至少 8 位，且需同时包含字母和数字'); return;
+    }
+    if (newPassword !== confirmPassword) { setError('两次输入的新密码不一致'); return; }
+    setPwdBusy(true);
+    try {
+      // changePassword 成功后已把新 token 写入本地会话，当前登录态无缝延续
+      await api.changePassword({ currentPassword, newPassword });
+      setPwd({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setPwdDone(true);
+      setTimeout(() => setPwdDone(false), 3000);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPwdBusy(false);
+    }
+  }
+
+  async function submitCloseAccount() {
+    setError('');
+    const password = window.prompt('注销账号不可恢复：将永久删除你的全部会话、消息、知识库文件与用量记录。\n请输入当前密码确认注销：');
+    if (password === null) return;
+    if (!password.trim()) { setError('注销账号需要输入当前密码'); return; }
+    if (!window.confirm('再次确认：注销后所有数据立即删除且无法找回，确定继续？')) return;
+    setCloseBusy(true);
+    try {
+      await api.closeAccount(password.trim());
+      // 账号已删除：清理本地会话并广播登出，回到登录页
+      clearSession();
+      window.dispatchEvent(new Event('vireo:logout'));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setCloseBusy(false);
     }
   }
 
@@ -294,6 +340,33 @@ export default function Settings({ status, refreshStatus }) {
       <section className="card">
         <h3>账号</h3>
         <p className="muted card-desc">邮箱：{status?.user?.email}；今日消息：{status?.quota?.used ?? 0}{status?.quota?.limit ? ` / ${status.quota.limit}` : '（无限制）'} 条</p>
+
+        <h4 className="sub-head">修改密码</h4>
+        <p className="muted card-desc">修改后其他设备与页面的登录状态会立即失效，需用新密码重新登录。</p>
+        <div className="provider-form">
+          <input type="password" placeholder="当前密码" value={pwd.currentPassword} autoComplete="current-password"
+            onChange={(e) => setPwd((v) => ({ ...v, currentPassword: e.target.value }))} />
+          <input type="password" placeholder="新密码（≥8 位，含字母和数字）" value={pwd.newPassword} autoComplete="new-password"
+            onChange={(e) => setPwd((v) => ({ ...v, newPassword: e.target.value }))} />
+          <input type="password" placeholder="确认新密码" value={pwd.confirmPassword} autoComplete="new-password"
+            onKeyDown={(e) => { if (e.key === 'Enter') submitPassword(); }}
+            onChange={(e) => setPwd((v) => ({ ...v, confirmPassword: e.target.value }))} />
+          <button className="btn primary" onClick={submitPassword}
+            disabled={pwdBusy || !pwd.currentPassword || !pwd.newPassword || !pwd.confirmPassword}>
+            {pwdBusy ? '提交中…' : '修改密码'}
+          </button>
+        </div>
+        {pwdDone && <span className="saved-tip">✓ 密码已修改</span>}
+
+        {!isAdmin && (
+          <>
+            <h4 className="sub-head danger-title">注销账号</h4>
+            <p className="muted card-desc">永久删除本账号及其全部会话、消息、知识库文件与用量记录，操作不可恢复。</p>
+            <button className="btn danger" onClick={submitCloseAccount} disabled={closeBusy}>
+              {closeBusy ? '注销中…' : '注销我的账号'}
+            </button>
+          </>
+        )}
       </section>
     </div>
   );

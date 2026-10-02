@@ -545,6 +545,10 @@ a:hover { text-decoration: underline; }
 .key-status { font-size: 12px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .row-actions { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
 .saved-tip { color: var(--ok); font-size: 13px; font-weight: 600; }
+.sub-head { font-size: 14px; font-weight: 700; margin: 18px 0 4px; color: var(--text); }
+.sub-head.danger-title { color: var(--danger); }
+.btn.danger { background: var(--danger); color: #fff; border: none; box-shadow: 0 4px 14px -6px rgba(229, 72, 77, 0.6); }
+.btn.danger:hover { filter: brightness(1.06); }
 .search-test { display: flex; gap: 8px; margin-top: 6px; }
 .search-test input { flex: 1; }
 .search-results { list-style: none; padding: 0; margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }

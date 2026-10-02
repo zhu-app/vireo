@@ -41,7 +41,7 @@ import {
   migrateStaleModelRefs,
   PROVIDER_DEFAULTS,
 } from './gateway.js';
-import { isSupported, ingestFile, retrieveChunks, buildKbContext, deleteFileArtifacts } from './kb.js';
+import { isSupported, ingestFile, retrieveChunks, buildKbContext, deleteFileArtifacts, MAX_FILE_BYTES } from './kb.js';
 import { webSearch, searchStatus, SearchError, buildSearchContext } from './search.js';
 import { embeddingStatus } from './embedding.js';
 import { rateLimit } from './ratelimit.js';
@@ -50,6 +50,22 @@ const app = express();
 const port = Number(process.env.PORT || 8080);
 seedAdmin(hashPassword);
 migrateStaleModelRefs();
+
+// 重启自愈：若上次进程在文件解析中途退出，数据库会留下 status='pending' 的僵尸行，
+// 前端将永远显示"解析中"。把它们重新入队（格式不支持的转 unsupported），恢复处理。
+// 导出供单元测试直接调用；服务启动时执行一次。
+export function requeuePendingFiles() {
+  const rows = db.prepare("SELECT * FROM files WHERE status = 'pending'").all();
+  for (const row of rows) {
+    if (isSupported(row.name, row.mime)) {
+      ingestFile(row).catch(() => {});
+    } else {
+      db.prepare("UPDATE files SET status = 'unsupported', note = '暂不支持该格式的知识库解析（当前支持 txt/md/csv/json 等文本文件）', chunks = 0 WHERE id = ?").run(row.id);
+    }
+  }
+  return rows.length;
+}
+requeuePendingFiles();
 
 // 仅在明确部署于反代之后时开启：默认信任 X-Forwarded-For 会让直连方伪造头绕过按 IP 的限流
 if (['1', 'true'].includes(String(process.env.TRUST_PROXY || '').toLowerCase())) {
@@ -71,8 +87,15 @@ app.use((_, res, next) => {
   next();
 });
 
+// 密码强度：≥8 位且至少包含一个字母和一个数字（注册与修改密码共用）
+const PWD_MESSAGE = '密码至少 8 位，且需同时包含字母和数字';
+const passwordSchema = z
+  .string()
+  .max(128, '密码过长')
+  .refine((v) => v.length >= 8 && /[A-Za-z]/.test(v) && /\d/.test(v), PWD_MESSAGE);
+
 const Z = {
-  register: z.object({ name: z.string().trim().max(40).optional(), email: z.string().email('邮箱格式不正确'), password: z.string().min(8, '密码至少 8 位').max(128) }),
+  register: z.object({ name: z.string().trim().max(40).optional(), email: z.string().email('邮箱格式不正确'), password: passwordSchema }),
   login: z.object({ email: z.string().min(3), password: z.string().min(1) }),
   chat: z.object({ title: z.string().trim().max(80).optional(), model: z.string().max(60).optional() }),
   stream: z
@@ -103,6 +126,8 @@ const Z = {
     apiKeys: z.record(z.string().min(1).max(40), z.string().max(200)).optional(),
   }),
   provider: z.object({ name: z.string().trim().min(1).max(40), baseUrl: z.string().trim().min(10).max(300), key: z.string().max(200).optional() }),
+  passwordChange: z.object({ currentPassword: z.string().min(1).max(128), newPassword: passwordSchema }),
+  closeAccount: z.object({ password: z.string().min(1).max(128) }),
   manualModel: z.object({ provider: z.string().trim().min(1).max(40), modelId: z.string().trim().min(1).max(60) }),
   providerUpdate: z.object({ name: z.string().trim().min(1).max(40).optional(), baseUrl: z.string().trim().min(10).max(300).optional(), key: z.string().max(200).optional() }),
   adminUser: z.object({ disabled: z.boolean().optional(), dailyLimit: z.number().int().min(0).max(1000000).optional(), name: z.string().trim().min(1).max(40).optional() }),
@@ -137,6 +162,39 @@ const loginLimiter = rateLimit({
   message: '登录尝试过于频繁，请 1 分钟后再试',
 });
 
+// 账号维度锁定：同一邮箱连续密码错误达到阈值后临时拒绝登录（与 IP 维度限流互补）。
+// 阈值默认 5 次、锁定 15 分钟，可用 LOGIN_FAIL_MAX / LOGIN_LOCK_MS 调整。
+const FAIL_MAX = Number(process.env.LOGIN_FAIL_MAX || 5);
+const FAIL_WINDOW_MS = Number(process.env.LOGIN_LOCK_MS || 15 * 60_000);
+const loginFailures = new Map(); // email -> { count, firstAt }
+
+function failureState(email) {
+  const rec = loginFailures.get(email);
+  if (!rec) return null;
+  if (Date.now() - rec.firstAt > FAIL_WINDOW_MS) {
+    loginFailures.delete(email); // 窗口已过，计数自然复位
+    return null;
+  }
+  return rec;
+}
+
+function registerFailure(email) {
+  const rec = failureState(email);
+  if (!rec) {
+    loginFailures.set(email, { count: 1, firstAt: Date.now() });
+    return 1;
+  }
+  rec.count += 1;
+  return rec.count;
+}
+
+// 定期回收过期计数，避免内存随尝试过的邮箱数增长
+const failSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [email, rec] of loginFailures) if (now - rec.firstAt > FAIL_WINDOW_MS) loginFailures.delete(email);
+}, 60_000);
+failSweeper.unref?.();
+
 api.post('/auth/register', authLimiter, (req, res) => {
   const body = validate(Z.register, req.body, res);
   if (!body) return;
@@ -154,21 +212,59 @@ api.post('/auth/register', authLimiter, (req, res) => {
     `INSERT INTO users (id, name, email, password_hash, role, daily_limit, disabled, created_at)
      VALUES (?, ?, ?, ?, 'user', 50, 0, ?)`
   ).run(user.id, user.name, user.email, user.password, Date.now());
-  res.status(201).json({ token: signToken({ id: user.id, role: 'user' }), user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(user.id)) });
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  res.status(201).json({ token: signToken(row), user: publicUser(row) });
 });
 
 api.post('/auth/login', authLimiter, loginLimiter, (req, res) => {
   const body = validate(Z.login, req.body, res);
   if (!body) return;
+  const emailKey = String(body.email || '').toLowerCase();
+  const locked = failureState(emailKey);
+  if (locked && locked.count >= FAIL_MAX) {
+    return res.status(423).json({ error: '密码错误次数过多，该账号已被临时锁定，请稍后再试' });
+  }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(body.email);
   if (!user || !verifyPassword(body.password, user.password_hash)) {
+    const count = registerFailure(emailKey);
+    if (count >= FAIL_MAX) return res.status(423).json({ error: '密码错误次数过多，该账号已被临时锁定，请稍后再试' });
     return res.status(401).json({ error: '邮箱或密码不正确' });
   }
   if (user.disabled) return res.status(403).json({ error: '该账号已被停用' });
+  loginFailures.delete(emailKey); // 成功登录清零失败计数
   res.json({ token: signToken(user), user: publicUser(user) });
 });
 
 api.get('/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
+
+// 修改密码：校验旧密码与强度，成功后 pwd_changed_at 变化 → 该账号所有旧 token 立即失效
+api.post('/auth/password', auth, (req, res) => {
+  const body = validate(Z.passwordChange, req.body || {}, res);
+  if (!body) return;
+  if (!verifyPassword(body.currentPassword, req.user.password_hash)) {
+    return res.status(401).json({ error: '当前密码不正确' });
+  }
+  if (body.currentPassword === body.newPassword) {
+    return res.status(400).json({ error: '新密码不能与当前密码相同' });
+  }
+  const now = Date.now();
+  db.prepare('UPDATE users SET password_hash = ?, pwd_changed_at = ? WHERE id = ?').run(hashPassword(body.newPassword), now, req.user.id);
+  // 返回新 token：当前会话无需强制重新登录（其他设备/页面的旧 token 已失效）
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  res.json({ ok: true, token: signToken(updated) });
+});
+
+// 注销账号：验证密码后级联删除该用户的全部数据（含知识库原文件），不可恢复。管理员账号不支持自助注销。
+api.delete('/auth/me', auth, (req, res) => {
+  const body = validate(Z.closeAccount, req.body || {}, res);
+  if (!body) return;
+  if (!verifyPassword(body.password, req.user.password_hash)) {
+    return res.status(401).json({ error: '密码不正确' });
+  }
+  if (req.user.role === 'admin') return res.status(400).json({ error: '管理员账号不支持自助注销，请通过管理后台操作' });
+  destroyUser(req.user.id);
+  res.json({ ok: true });
+});
 
 // ---------- 模型与状态 ----------
 api.get('/models', auth, (req, res) => res.json(listModels().map((m) => ({ ...m, available: Boolean(resolveApiKey(req.user.id, m.provider).key) }))));
@@ -331,7 +427,7 @@ try {
 }
 const upload = multer({
   dest: uploadTmpDir,
-  limits: { fileSize: 20 * 1024 * 1024, files: 8 },
+  limits: { fileSize: MAX_FILE_BYTES, files: 8 },
   fileFilter(_, file, cb) {
     const name = Buffer.from(file.originalname, 'latin1').toString('utf8');
     const ext = path.extname(name).toLowerCase();
@@ -351,7 +447,7 @@ api.post('/files', auth, (req, res) => {
         try { fs.unlinkSync(f.path); } catch {}
       }
       const message = String(uploadError?.message || '').includes('File too large')
-        ? '单个文件不能超过 20MB'
+        ? '单个文件不能超过 5MB'
         : uploadError?.message || '上传失败';
       return res.status(400).json({ error: message });
     }
@@ -772,22 +868,28 @@ admin.patch('/users/:id', (req, res) => {
   res.json(publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(user.id)));
 });
 
+// 级联删除用户全部数据：会话/消息/知识库（分块+磁盘原文件）/用量/个人设置。
+// 管理端强制删除与用户自助注销共用此函数；调用方负责管理员账号的保护。
+function destroyUser(userId) {
+  const fileRows = db.prepare('SELECT * FROM files WHERE user_id = ?').all(userId);
+  db.transaction(() => {
+    db.prepare('DELETE FROM messages WHERE chat_id IN (SELECT id FROM chats WHERE user_id = ?)').run(userId);
+    db.prepare('DELETE FROM chats WHERE user_id = ?').run(userId);
+    for (const f of fileRows) deleteFileArtifacts(f);
+    db.prepare('DELETE FROM kb_chunks WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM files WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM usage WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM settings WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+  })();
+}
+
 // 删除用户：连带清理其会话、消息、知识库（分块+原文件）、用量与设置。管理员账号不可删除。
 admin.delete('/users/:id', (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: '用户不存在' });
   if (user.role === 'admin') return res.status(400).json({ error: '不能删除管理员账号' });
-  const fileRows = db.prepare('SELECT * FROM files WHERE user_id = ?').all(user.id);
-  db.transaction(() => {
-    db.prepare('DELETE FROM messages WHERE chat_id IN (SELECT id FROM chats WHERE user_id = ?)').run(user.id);
-    db.prepare('DELETE FROM chats WHERE user_id = ?').run(user.id);
-    for (const f of fileRows) deleteFileArtifacts(f);
-    db.prepare('DELETE FROM kb_chunks WHERE user_id = ?').run(user.id);
-    db.prepare('DELETE FROM files WHERE user_id = ?').run(user.id);
-    db.prepare('DELETE FROM usage WHERE user_id = ?').run(user.id);
-    db.prepare('DELETE FROM settings WHERE user_id = ?').run(user.id);
-    db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
-  })();
+  destroyUser(user.id);
   res.json({ ok: true, deletedUser: publicUser(user) });
 });
 
