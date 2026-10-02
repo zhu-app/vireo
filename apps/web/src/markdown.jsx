@@ -53,12 +53,12 @@ function CodeBlock({ lang, code }) {
   );
 }
 
-function renderTable(rows) {
+function renderTable(rows, blockKey) {
   const parse = (line) => line.replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
   const head = parse(rows[0]);
   const body = rows.slice(2).map(parse);
   return (
-    <div className="table-wrap">
+    <div className="table-wrap" key={blockKey}>
       <table>
         <thead><tr>{head.map((h, i) => <th key={i}>{h}</th>)}</tr></thead>
         <tbody>
@@ -139,7 +139,7 @@ export function Markdown({ text, streaming }) {
         rows.push(lines[i].trim());
         i += 1;
       }
-      blocks.push(renderTable(rows));
+      blocks.push(renderTable(rows, key++));
       continue;
     }
 

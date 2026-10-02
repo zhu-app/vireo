@@ -28,7 +28,7 @@ jobs:
       - name: 前端构建
         run: npm run build -w @vireo/web
 
-      - name: 前端测试（当前无用例，passWithNoTests）
+      - name: 前端单元测试（markdown 渲染 / SSE 解析）
         run: npm test -w @vireo/web
 
   docker:

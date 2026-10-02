@@ -85,6 +85,7 @@ infra/      docker-compose.yml
 ## 验证
 
 - 后端集成测试（真实起 Express + SQLite + mock 上游，覆盖鉴权/限流/流式/重新生成旧回复保护/上传白名单/下载越权）：`npm test -w @vireo/api`
+- 前端单元测试（markdown 渲染器 XSS 白名单与语法规则、SSE 分包/状态机解析）：`npm test -w @vireo/web`
 - 前端构建：`npm run build -w @vireo/web`
 - 离线冒烟：`node apps/api/test/mock-upstream.mjs` 提供本地标准 SSE 上游，可手动验证流式全链路
 - CI：`.github/workflows/ci.yml` 在 push / PR 时自动执行语法检查、集成测试、前端构建与两个镜像的构建
