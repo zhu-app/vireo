@@ -19,6 +19,8 @@ export default function Settings({ status, refreshStatus }) {
   const [discoverMsg, setDiscoverMsg] = useState('');
   const [newProvider, setNewProvider] = useState({ name: '', baseUrl: '', key: '' });
   const [providerBusy, setProviderBusy] = useState(false);
+  const [manual, setManual] = useState({ provider: '', modelId: '' });
+  const [manualBusy, setManualBusy] = useState(false);
 
   const isAdmin = status?.user?.role === 'admin';
 
@@ -82,6 +84,25 @@ export default function Settings({ status, refreshStatus }) {
     }
   }
 
+  async function submitManualModel() {
+    const provider = manual.provider;
+    const modelId = manual.modelId.trim();
+    if (!provider || !modelId) { setError('请选择供应商并填写模型 ID'); return; }
+    setManualBusy(true);
+    setError('');
+    try {
+      const m = await api.addManualModel(provider, modelId);
+      setManual({ provider: '', modelId: '' });
+      setDiscoverMsg(`✓ 已添加模型「${m.name}」（${m.id}），可在对话页选择使用`);
+      await loadModels();
+      refreshStatus?.();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setManualBusy(false);
+    }
+  }
+
   useEffect(() => {
     if (status?.keys) setKeys(Object.fromEntries((status.providers || []).map((p) => [p.id, ''])));
   }, [status]);
@@ -107,6 +128,17 @@ export default function Settings({ status, refreshStatus }) {
 
   const providerName = (id) => providers.find((p) => p.id === id)?.name || id;
 
+  async function clearKey(providerId) {
+    if (!window.confirm(`删除「${providerName(providerId)}」的个人密钥？删除后若管理员配有平台 Key，将自动改用平台 Key。`)) return;
+    setError('');
+    try {
+      await api.saveSettings({ apiKeys: { [providerId]: '' } });
+      refreshStatus?.();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   return (
     <div className="page">
       <header className="page-head">
@@ -126,6 +158,9 @@ export default function Settings({ status, refreshStatus }) {
                   <em className={`kb-status ready`}>已配置{info.source === 'platform' ? '（平台）' : info.source === 'env' ? '（环境）' : ''} {info.masked}</em>
                 ) : (
                   <em className="kb-status failed">未配置</em>
+                )}
+                {info?.configured && info.source === 'user' && (
+                  <button className="btn sm danger-ghost" onClick={() => clearKey(p.id)} title="删除我的个人密钥">删除</button>
                 )}
               </div>
               <input
@@ -171,6 +206,38 @@ export default function Settings({ status, refreshStatus }) {
               ))}
             </ul>
           )}
+        </section>
+      )}
+
+      {isAdmin && (
+        <section className="card">
+          <h3>手动添加模型</h3>
+          <p className="muted card-desc">
+            适用于不提供「获取模型列表」接口的上游（如微信 Coding Plan，调用 /v1/models 会报 400）。
+            从平台页面原样复制模型 ID 填入，添加后与发现的模型一样进入对话页下拉框，全平台共享。
+            聊天调用本身不依赖列表接口，只要模型 ID 准确即可正常使用。
+          </p>
+          <div className="provider-form">
+            <select
+              value={manual.provider}
+              onChange={(e) => setManual((v) => ({ ...v, provider: e.target.value }))}
+            >
+              <option value="">选择供应商…</option>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}{p.custom ? '' : '（内置）'}</option>
+              ))}
+            </select>
+            <input
+              placeholder="模型 ID（从平台页面复制，如 deepseek-v4-flash）"
+              value={manual.modelId}
+              onChange={(e) => setManual((v) => ({ ...v, modelId: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === 'Enter') submitManualModel(); }}
+            />
+            <span className="muted" style={{ fontSize: 12 }}>大小写以平台页面为准</span>
+            <button className="btn primary" onClick={submitManualModel} disabled={manualBusy || !manual.provider || !manual.modelId.trim()}>
+              {manualBusy ? '添加中…' : '＋ 添加模型'}
+            </button>
+          </div>
         </section>
       )}
 

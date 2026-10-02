@@ -14,13 +14,29 @@ export default function Admin() {
   useEffect(() => {
     api.adminStats().then(setStats).catch((e) => setError(e.message));
     api.adminUsers().then(setUsers).catch((e) => setError(e.message));
-    api.adminKeys().then(setKeys).catch((e) => setError(e.message));
     api.providers().then(setProviders).catch(() => {});
   }, []);
+
+  // 每次进入「平台密钥」标签都重新拉取，避免挂载后其他页面新存的 Key 不显示、无「清除」按钮
+  useEffect(() => {
+    if (tab === 'keys') api.adminKeys().then(setKeys).catch((e) => setError(e.message));
+  }, [tab]);
 
   async function patchUser(id, body) {
     await api.adminPatchUser(id, body).catch((e) => setError(e.message));
     setUsers(await api.adminUsers());
+  }
+
+  async function deleteUser(u) {
+    const extra = u.messageCount ? `及其 ${u.messageCount} 条消息、用量与知识库文件` : '';
+    if (!window.confirm(`彻底删除用户「${u.name}（${u.email}）」？该操作不可恢复，会连带清除${extra || '其用量与设置'}。`)) return;
+    try {
+      await api.adminDeleteUser(u.id);
+      setUsers(await api.adminUsers());
+      setStats(await api.adminStats());
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   function editQuota(u) {
@@ -39,6 +55,17 @@ export default function Admin() {
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
     setKeys(await api.adminKeys());
+  }
+
+  async function clearKey(provider) {
+    const label = provider === 'search' ? '搜索服务' : providers.find((x) => x.id === provider)?.name || provider;
+    if (!window.confirm(`清除「${label}」的平台密钥？清除后若该供应商无环境变量 Key，用户需各自填写个人 Key 才能使用。`)) return;
+    try {
+      await api.adminSaveKeys({ [provider]: '' });
+      setKeys(await api.adminKeys());
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   const maxDaily = Math.max(1, ...(stats?.daily || []).map((d) => d.tokens || 0));
@@ -111,8 +138,9 @@ export default function Admin() {
                 <span className="kb-ops">
                   {u.role !== 'admin' && (
                     <>
-                      <button onClick={() => editQuota(u)}>额度</button>
-                      <button className={u.disabled ? '' : 'danger'} onClick={() => patchUser(u.id, { disabled: !u.disabled })}>{u.disabled ? '启用' : '停用'}</button>
+                      <button onClick={() => editQuota(u)} title="设置每日额度">✎</button>
+                      <button onClick={() => patchUser(u.id, { disabled: !u.disabled })} title={u.disabled ? '启用该用户' : '停用该用户'}>{u.disabled ? '启' : '停'}</button>
+                      <button className="danger" onClick={() => deleteUser(u)} title="彻底删除该用户">删</button>
                     </>
                   )}
                 </span>
@@ -132,6 +160,9 @@ export default function Admin() {
               <div className="key-label"><b>{p === 'search' ? '搜索服务（Tavily）' : prov?.name || p}</b>{prov?.custom && <i>{prov.baseUrl}</i>}</div>
               <div className="key-status">
                 {info?.configured ? <em className="kb-status ready">已配置 {info.masked}</em> : <em className="kb-status failed">未配置</em>}
+                {info?.configured && (
+                  <button className="btn sm danger-ghost" onClick={() => clearKey(p)} title="从平台移除该密钥">清除</button>
+                )}
               </div>
               <input
                 type="password"

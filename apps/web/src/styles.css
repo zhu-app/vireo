@@ -128,6 +128,9 @@ a:hover { text-decoration: underline; }
 .btn.primary:hover { filter: brightness(1.07); }
 .btn.block { width: 100%; }
 .btn.stop { background: var(--danger); color: #fff; border: none; }
+.btn.sm { padding: 5px 10px; font-size: 12.5px; gap: 0; }
+.btn.danger-ghost { background: transparent; border-color: transparent; color: var(--text-3); }
+.btn.danger-ghost:hover { color: var(--danger); border-color: rgba(229, 72, 77, 0.35); transform: none; box-shadow: none; }
 .icon-btn {
   width: 34px; height: 34px; border-radius: var(--radius-s);
   display: inline-flex; align-items: center; justify-content: center;
@@ -379,6 +382,28 @@ a:hover { text-decoration: underline; }
 
 /* ---------- 输入区 ---------- */
 .composer-wrap { flex: none; padding: 6px 18px 10px; }
+.att-strip {
+  width: min(820px, 100%); margin: 0 auto 6px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+}
+.att-label { font-size: 11.5px; color: var(--text-3); margin-right: 2px; }
+.att-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text-2);
+  background: var(--bg-sunken); border: 1px solid var(--border);
+  border-radius: 999px; padding: 3px 6px 3px 9px; max-width: 260px;
+}
+.att-chip.ready { border-color: rgba(64, 178, 122, 0.35); }
+.att-chip.failed, .att-chip.unsupported { border-color: rgba(229, 72, 77, 0.35); }
+.att-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); flex: none; }
+.att-chip.ready .att-dot { background: var(--ok); }
+.att-chip.pending .att-dot { background: #f5a623; animation: att-pulse 1s ease-in-out infinite; }
+.att-chip.failed .att-dot, .att-chip.unsupported .att-dot { background: var(--danger); }
+@keyframes att-pulse { 50% { opacity: 0.35; } }
+.att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-status { font-style: normal; color: var(--text-3); font-size: 11px; flex: none; }
+.att-x { border: none; background: transparent; color: var(--text-3); font-size: 13px; cursor: pointer; padding: 0 3px; line-height: 1; border-radius: 50%; }
+.att-x:hover { color: var(--danger); background: rgba(229, 72, 77, 0.1); }
 .key-hint {
   width: min(820px, 100%); margin: 0 auto 8px; font-size: 13px;
   background: rgba(245, 166, 35, 0.12); border: 1px solid rgba(245, 166, 35, 0.3);
@@ -511,13 +536,13 @@ a:hover { text-decoration: underline; }
 
 /* 设置页 */
 .key-row {
-  display: grid; grid-template-columns: minmax(160px, 1fr) 170px minmax(180px, 1.4fr) auto;
+  display: grid; grid-template-columns: minmax(160px, 1fr) auto minmax(180px, 1.4fr) auto;
   gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px dashed var(--border);
 }
 .key-row:last-of-type { border-bottom: none; }
 .key-label b { font-size: 14px; }
 .key-label i { font-style: normal; display: block; font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
-.key-status { font-size: 12px; }
+.key-status { font-size: 12px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .row-actions { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
 .saved-tip { color: var(--ok); font-size: 13px; font-weight: 600; }
 .search-test { display: flex; gap: 8px; margin-top: 6px; }

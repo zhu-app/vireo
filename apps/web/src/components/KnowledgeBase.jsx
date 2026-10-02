@@ -94,8 +94,8 @@ export default function KnowledgeBase({ status, refreshStatus }) {
               </span>
               <span>{new Date(f.createdAt).toLocaleDateString('zh-CN')}</span>
               <span className="kb-ops">
-                {(f.status === 'failed' || f.status === 'pending') && (
-                  <button onClick={async () => { await api.reindexFile(f.id); load(); }} title="重新解析">↻</button>
+                {(f.status === 'failed' || f.status === 'pending' || f.status === 'ready') && (
+                  <button onClick={async () => { await api.reindexFile(f.id); load(); }} title={f.status === 'ready' ? '重新解析（配置嵌入 Key 后可补语义向量）' : '重新解析'}>↻</button>
                 )}
                 <button onClick={async () => { try { await api.downloadFile(f.id, f.name); } catch (err) { setError(err.message); } }} title="下载原文件">↓</button>
                 <button className="danger" onClick={async () => { if (confirm(`删除「${f.name}」？`)) { await api.deleteFile(f.id); await load(); refreshStatus?.(); } }} title="删除">×</button>

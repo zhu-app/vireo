@@ -57,6 +57,7 @@ export const api = {
   updateProvider: (id, body) => request(`/api/providers/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteProvider: (id) => request(`/api/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   discoverModels: (provider) => request('/api/models/discover', { method: 'POST', body: JSON.stringify({ provider }) }),
+  addManualModel: (provider, modelId) => request('/api/models/manual', { method: 'POST', body: JSON.stringify({ provider, modelId }) }),
   removeModel: (id) => request(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   status: () => request('/api/status'),
   chats: () => request('/api/chats'),
@@ -65,11 +66,13 @@ export const api = {
   renameChat: (chatId, title) => request(`/api/chats/${chatId}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
   deleteChat: (chatId) => request(`/api/chats/${chatId}`, { method: 'DELETE' }),
   files: () => request('/api/files'),
-  uploadFiles: (fileList) => {
+  uploadFiles: (fileList, chatId) => {
     const form = new FormData();
     [...fileList].forEach((f) => form.append('files', f));
+    if (chatId) form.append('chatId', chatId);
     return request('/api/files', { method: 'POST', body: form });
   },
+  attachments: (chatId) => request(`/api/chats/${encodeURIComponent(chatId)}/attachments`),
   deleteFile: (id) => request(`/api/files/${id}`, { method: 'DELETE' }),
   reindexFile: (id) => request(`/api/files/${id}/reindex`, { method: 'POST' }),
   // 下载需要 Authorization，无法用裸链接，改为 fetch blob 后触发浏览器保存
@@ -95,6 +98,7 @@ export const api = {
   stop: (requestId) => request('/api/chat/stop', { method: 'POST', body: JSON.stringify({ requestId }) }),
   adminUsers: () => request('/api/admin/users'),
   adminPatchUser: (id, body) => request(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  adminDeleteUser: (id) => request(`/api/admin/users/${id}`, { method: 'DELETE' }),
   adminKeys: () => request('/api/admin/keys'),
   adminSaveKeys: (body) => request('/api/admin/keys', { method: 'PUT', body: JSON.stringify(body) }),
   adminStats: () => request('/api/admin/stats'),
