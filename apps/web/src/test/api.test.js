@@ -66,7 +66,13 @@ describe('streamChat：SSE 帧解析', () => {
     expect(onDelta).toHaveBeenCalledTimes(2);
     expect(onDelta).toHaveBeenNthCalledWith(1, { content: '你' });
     expect(onDelta).toHaveBeenNthCalledWith(2, { reasoning: '思考中' });
-    expect(onDone).toHaveBeenLastCalledWith({ aborted: false, usage: { prompt: 10, completion: 5 } });
+    expect(onDone).toHaveBeenLastCalledWith({
+      aborted: false,
+      usage: { prompt: 10, completion: 5 },
+      savedMessageId: null,
+      deletedMessageId: null,
+      userMessageId: null,
+    });
     expect(onError).not.toHaveBeenCalled();
     expect(handle.requestId).toMatch(/^req-/);
   });
@@ -119,6 +125,25 @@ describe('streamChat：SSE 帧解析', () => {
     const body = JSON.parse(init.body);
     expect(body).toMatchObject({ chatId: 'c1', model: 'm1', regenerate: true });
     expect(body.requestId).toMatch(/^req-/);
+  });
+
+  it('编辑重发：editMessageId 透传请求体，done 帧回传三个消息 id', async () => {
+    const onDone = vi.fn();
+    const fetchMock = vi.fn(async () => sseRes([{
+      done: true, aborted: false,
+      savedMessageId: 'msg-new-a', deletedMessageId: 'msg-old-a', userMessageId: 'msg-user-1',
+    }]));
+    vi.stubGlobal('fetch', fetchMock);
+    streamChat({ ...baseArgs, editMessageId: 'msg-user-1' }, { onDone });
+    await vi.waitFor(() => expect(onDone).toHaveBeenCalledOnce());
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.editMessageId).toBe('msg-user-1');
+    expect(body.regenerate).toBeUndefined();
+    expect(onDone).toHaveBeenCalledWith({
+      aborted: false, usage: null,
+      savedMessageId: 'msg-new-a', deletedMessageId: 'msg-old-a', userMessageId: 'msg-user-1',
+    });
   });
 
   it('stop() 中止本地读取并通知后端 /api/chat/stop', async () => {

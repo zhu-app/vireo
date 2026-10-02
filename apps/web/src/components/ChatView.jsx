@@ -44,8 +44,10 @@ function ReasoningBlock({ reasoning, streaming }) {
   );
 }
 
-function Message({ message, isLast, busy, onRegenerate, modelLabel }) {
+function Message({ message, idx, isLast, busy, onRegenerate, onEdit, modelLabel }) {
   const [copied, setCopied] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
   const isUser = message.role === 'user';
   const copy = async () => {
     try {
@@ -54,6 +56,13 @@ function Message({ message, isLast, busy, onRegenerate, modelLabel }) {
       setTimeout(() => setCopied(false), 1500);
     } catch {}
   };
+  const startEdit = () => { setDraft(message.content); setEditing(true); };
+  const saveEdit = () => {
+    const next = draft.trim();
+    if (!next) return;
+    setEditing(false);
+    if (next !== message.content) onEdit?.(idx, next);
+  };
   return (
     <article className={`msg ${isUser ? 'user' : 'assistant'}`}>
       <div className="avatar">{isUser ? '你' : <span className="logo-mark sm" />}</div>
@@ -61,10 +70,26 @@ function Message({ message, isLast, busy, onRegenerate, modelLabel }) {
         {!isUser && message.reasoning && <ReasoningBlock reasoning={message.reasoning} streaming={isLast && busy && !message.content} />}
         {!isUser && message.notices?.map((n, i) => <Notice key={i} notice={n} />)}
         <div className="bubble">
-          {isUser ? <p className="user-text">{message.content}</p> : message.content ? <Markdown text={message.content} streaming={isLast && busy} /> : !busy ? <span className="muted">（空回复）</span> : null}
+          {isUser && editing ? (
+            <div className="msg-edit">
+              <textarea
+                rows={Math.min(8, Math.max(2, draft.split('\n').length))}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Escape') setEditing(false); }}
+              />
+              <div className="msg-edit-actions">
+                <button className="btn primary sm" onClick={saveEdit} disabled={!draft.trim()}>保存并重新生成</button>
+                <button className="btn sm" onClick={() => setEditing(false)}>取消</button>
+                <span className="muted edit-hint">将替换该条之后的全部对话</span>
+              </div>
+            </div>
+          ) : isUser ? <p className="user-text">{message.content}</p>
+            : message.content ? <Markdown text={message.content} streaming={isLast && busy} /> : !busy ? <span className="muted">（空回复）</span> : null}
         </div>
         <div className="msg-actions">
           <button onClick={copy} title="复制">{copied ? '✓ 已复制' : '复制'}</button>
+          {isUser && message.id && !busy && !editing && <button onClick={startEdit} title="编辑后重新生成（替换此条之后的对话）">✎ 编辑</button>}
           {!isUser && isLast && !busy && onRegenerate && <button onClick={onRegenerate} title="重新生成">↻ 重新生成</button>}
           {!isUser && isLast && busy && <span className="typing"><i /><i /><i /></span>}
           {!isUser && message.content && !busy && <span className="model-tag">{modelLabel}</span>}
@@ -156,13 +181,22 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
     return list.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content }));
   }
 
-  function send(payloadText, { regenerate = false } = {}) {
-    const content = (payloadText ?? text).trim();
+  function send(payloadText, { regenerate = false, editAt = -1 } = {}) {
+    // editAt：被编辑消息在本地列表中的下标。其内容替换为 payloadText，
+    // 该条之后的消息从本地移除（后端仅在新回复成功后才真正截断）。
+    const content = editAt >= 0
+      ? (payloadText ?? '').trim()
+      : (payloadText ?? text).trim();
     if (!content || busy) return;
     setStreamError('');
 
     let base;
-    if (regenerate) {
+    let editTargetId = null;
+    if (editAt >= 0) {
+      const edited = { ...messages[editAt], content };
+      editTargetId = messages[editAt].id || null;
+      base = [...messages.slice(0, editAt), edited];
+    } else if (regenerate) {
       // 重新生成：去掉最后一条助手消息，保留其前的用户消息作为触发
       base = messages.slice(0, -1);
     } else {
@@ -171,12 +205,12 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
     const placeholder = { role: 'assistant', content: '', reasoning: '', notices: null, error: false };
     sendingRef.current = true;
     setMessages([...base, placeholder]);
-    if (!regenerate) setText('');
+    if (editAt < 0 && !regenerate) setText('');
     setBusy(true);
 
     const history = buildHistory(base);
     streamRef.current = streamChat(
-      { chatId: chat.id, model, messages: history, regenerate },
+      { chatId: chat.id, model, messages: history, regenerate, editMessageId: editTargetId || undefined },
       {
         onMeta: (meta) => {
           setMessages((cur) => {
@@ -195,7 +229,22 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
             return next;
           });
         },
-        onDone: () => { sendingRef.current = false; setStreamError(''); setBusy(false); },
+        onDone: (stats = {}) => {
+          // 回填库中真实 id：编辑重发时无 id 的用户气泡、以及占位的助手回复
+          setMessages((cur) => {
+            const next = [...cur];
+            if (stats.userMessageId && next.length >= 2) {
+              const ui = next.length - 2;
+              if (ui >= 0 && next[ui].role === 'user' && !next[ui].id) next[ui] = { ...next[ui], id: stats.userMessageId };
+            }
+            if (stats.savedMessageId) {
+              const li = next.length - 1;
+              if (li >= 0 && next[li]?.role === 'assistant') next[li] = { ...next[li], id: stats.savedMessageId };
+            }
+            return next;
+          });
+          sendingRef.current = false; setStreamError(''); setBusy(false);
+        },
         onError: (err) => {
           sendingRef.current = false;
           setStreamError(err.message);
@@ -223,6 +272,9 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
   };
 
   const regenerate = () => send(null, { regenerate: true });
+
+  // 编辑重发：content 为该条用户消息的新内容，基于它截断其后对话并重新生成
+  const editMessage = (idx, content) => send(content, { editAt: idx });
 
   async function onUpload(e) {
     const files = e.target.files;
@@ -391,7 +443,7 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
           </div>
         )}
         {messages.map((m, i) => (
-          <Message key={i} message={m} isLast={i === messages.length - 1} busy={busy} onRegenerate={m.role === 'assistant' && !m.error && !busy ? regenerate : undefined} modelLabel={currentModel?.name} />
+          <Message key={i} message={m} idx={i} isLast={i === messages.length - 1} busy={busy} onRegenerate={m.role === 'assistant' && !m.error && !busy ? regenerate : undefined} onEdit={m.role === 'user' && m.id && !busy ? editMessage : undefined} modelLabel={currentModel?.name} />
         ))}
       </div>
 

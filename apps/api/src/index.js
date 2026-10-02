@@ -115,6 +115,8 @@ const Z = {
         }),
       // 仅「重新生成」时替换上一条助手回复；普通发消息一律追加，绝不删除历史
       regenerate: z.boolean().optional(),
+      // 「编辑重发」：定位本会话内的一条用户消息，新回复成功落库时截断其后的全部消息
+      editMessageId: z.string().max(64).optional(),
     })
     .refine((b) => b.messages.some((m) => m.role === 'user' && m.content.trim()), {
       message: '缺少用户消息',
@@ -649,6 +651,17 @@ api.post('/chat/stream', auth, async (req, res) => {
   const history = body.messages.filter((m) => m.role !== 'system');
   const lastUser = [...history].reverse().find((m) => m.role === 'user');
 
+  // 编辑重发：定位本会话内被编辑的用户消息，立即把编辑后的新内容落库；
+  // 其后的旧尾部先保留，只有新回复成功落库的同一事务才截断（失败时数据不丢，
+  // 与「模型调用失败必须保留旧回复」红线同口径）。rowid 作截断锚点：比 created_at
+  // 严格单调，同毫秒写入的相邻消息也不会误伤/漏删。
+  let editTarget = null;
+  if (body.editMessageId) {
+    editTarget = db.prepare("SELECT id, rowid AS rid FROM messages WHERE id = ? AND chat_id = ? AND role = 'user'").get(body.editMessageId, chat.id);
+    if (!editTarget) return res.status(404).json({ error: '被编辑的消息不存在' });
+    db.prepare('UPDATE messages SET content = ? WHERE id = ?').run(lastUser?.content ?? '', editTarget.id);
+  }
+
   // 仅「重新生成」才定位上一条助手回复（且保留到成功落库后再删除）；
   // 普通发消息一律追加，绝不删除历史——旧版无条件顶掉上一条回复，导致刷新后记录丢失。
   const isRegenerate = body.regenerate === true;
@@ -656,10 +669,13 @@ api.post('/chat/stream', auth, async (req, res) => {
     ? db.prepare("SELECT * FROM messages WHERE chat_id = ? AND role = 'assistant' ORDER BY created_at DESC, id DESC LIMIT 1").get(chat.id)
     : null;
 
-  // 幂等：若最后一条用户消息尚未落库（首次发送场景），先保存
+  // 幂等：若最后一条用户消息尚未落库（首次发送场景），先保存；编辑重发时该消息已在库中（内容刚被更新）
   const lastSaved = db.prepare("SELECT * FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY created_at DESC, id DESC LIMIT 1").get(chat.id);
-  const userMessage = { id: newId(), chatId: chat.id, content: lastUser?.content ?? '' };
-  if (lastUser && (!lastSaved || lastSaved.content !== lastUser.content)) {
+  // 内容相同会跳过插入——此时必须复用库中已有行的 id，否则帧里回传的是未落库的假 id
+  // （前端据此回填后，用户再对它「编辑重发」会 404）
+  const reusedSaved = lastUser && !editTarget && lastSaved && lastSaved.content === lastUser.content ? lastSaved : null;
+  const userMessage = { id: editTarget ? editTarget.id : (reusedSaved ? reusedSaved.id : newId()), chatId: chat.id, content: lastUser?.content ?? '' };
+  if (lastUser && !editTarget && !reusedSaved) {
     db.prepare('INSERT INTO messages (id, chat_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)').run(userMessage.id, chat.id, 'user', userMessage.content, Date.now());
   }
 
@@ -810,6 +826,11 @@ api.post('/chat/stream', auth, async (req, res) => {
     const id = newId();
     let deletedId = null;
     db.transaction(() => {
+      // 编辑重发：截断被编辑消息之后的全部旧对话。放在 INSERT 之前——新行的 rowid 最大，
+      // 后置会被 rowid > ? 条件误删；事务保证失败时截断与落库一起回滚。
+      if (editTarget) {
+        db.prepare('DELETE FROM messages WHERE chat_id = ? AND rowid > ?').run(chat.id, editTarget.rid);
+      }
       db.prepare('INSERT INTO messages (id, chat_id, role, content, reasoning, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, chat.id, 'assistant', content, reasoning || null, Date.now());
       if (priorAssistant && priorAssistant.id !== id) {
         db.prepare('DELETE FROM messages WHERE id = ?').run(priorAssistant.id);
@@ -843,7 +864,7 @@ api.post('/chat/stream', auth, async (req, res) => {
       finished = true;
     } else {
       const saved = persistAssistant(result.content, result.reasoning, result);
-      safeWrite({ done: true, aborted: result.aborted, savedMessageId: saved.id, deletedMessageId: saved.deletedId, usage: { prompt: result.promptTokens, completion: result.completionTokens } });
+      safeWrite({ done: true, aborted: result.aborted, savedMessageId: saved.id, deletedMessageId: saved.deletedId, userMessageId: userMessage.id, usage: { prompt: result.promptTokens, completion: result.completionTokens } });
       finished = true;
     }
   } catch (error) {

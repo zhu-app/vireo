@@ -63,6 +63,12 @@ const mockServer = http.createServer((req, res) => {
       res.writeHead(404);
       return res.end();
     }
+    // 编辑重发失败保护用例：带 FAILCHAT 标记时模拟上游 500
+    if (raw.includes('FAILCHAT')) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'mock upstream boom' } }));
+      return;
+    }
     // 并发测试专用：请求里带 SLOWTEST 标记时，每 300ms 推一个分片、共约 6s，
     // 制造"长时间进行中"的流；客户端断开（stop）即停表，不向已关闭连接写入。
     if (raw.includes('SLOWTEST')) {
@@ -116,11 +122,11 @@ async function register(email) {
   return r.json.token;
 }
 
-async function streamOnce({ token, chatId, requestId, model, messages, regenerate }) {
+async function streamOnce({ token, chatId, requestId, model, messages, regenerate, editMessageId }) {
   const res = await fetch(`${BASE}/api/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ chatId, requestId, model, messages, regenerate: regenerate || undefined }),
+    body: JSON.stringify({ chatId, requestId, model, messages, regenerate: regenerate || undefined, editMessageId: editMessageId || undefined }),
   });
   return res.text();
 }
@@ -197,6 +203,61 @@ test('会话与流式对话全链路（发现后的模型）', async () => {
   assert.equal(msgs.json[0].role, 'user');
   assert.equal(msgs.json[1].content, '你好，Vireo 在线');
   firstAssistantId = msgs.json[1].id;
+});
+
+test('编辑重发：新回复成功后截断被编辑消息之后的全部旧对话', async () => {
+  // 先攒出一条更长的历史：u1(已有) a1 u2 a2
+  const chat2 = await api('POST', '/api/chats', { token: tokenA, body: { title: '编辑重发' } });
+  const cid = chat2.json.id;
+  await streamOnce({ token: tokenA, chatId: cid, requestId: 'req-edit-01', model: 'deepseek-chat', messages: [{ role: 'user', content: '第一问' }] });
+  await streamOnce({ token: tokenA, chatId: cid, requestId: 'req-edit-02', model: 'deepseek-chat', messages: [{ role: 'user', content: '第一问' }, { role: 'assistant', content: '你好，Vireo 在线' }, { role: 'user', content: '第二问' }] });
+  let msgs = await api('GET', `/api/chats/${cid}/messages`, { token: tokenA });
+  assert.equal(msgs.json.length, 4, '编辑前应有 4 条消息');
+  const firstUserId = msgs.json[0].id;
+
+  const sse = await streamOnce({
+    token: tokenA, chatId: cid, requestId: 'req-edit-03', model: 'deepseek-chat',
+    messages: [{ role: 'user', content: '第一问（已编辑）' }],
+    editMessageId: firstUserId,
+  });
+  assert.match(sse, /"done":true/);
+
+  msgs = await api('GET', `/api/chats/${cid}/messages`, { token: tokenA });
+  assert.equal(msgs.json.length, 2, '编辑重发后应只剩编辑的用户消息 + 新回复');
+  assert.equal(msgs.json[0].content, '第一问（已编辑）', '被编辑消息应落库新内容');
+  assert.equal(msgs.json[1].role, 'assistant');
+  assert.match(sse, new RegExp(msgs.json[0].id), 'done 帧应带回 userMessageId 供前端回填');
+});
+
+test('编辑重发：上游失败时编辑内容保留、旧尾部不被截断', async () => {
+  const chat3 = await api('POST', '/api/chats', { token: tokenA, body: { title: '编辑失败保护' } });
+  const cid = chat3.json.id;
+  await streamOnce({ token: tokenA, chatId: cid, requestId: 'req-editf-01', model: 'deepseek-chat', messages: [{ role: 'user', content: '原问题' }] });
+  await streamOnce({ token: tokenA, chatId: cid, requestId: 'req-editf-02', model: 'deepseek-chat', messages: [{ role: 'user', content: '原问题' }, { role: 'assistant', content: '你好，Vireo 在线' }, { role: 'user', content: '第二问' }] });
+  const before = await api('GET', `/api/chats/${cid}/messages`, { token: tokenA });
+  assert.equal(before.json.length, 4);
+  const firstUserId = before.json[0].id;
+
+  const sse = await streamOnce({
+    token: tokenA, chatId: cid, requestId: 'req-editf-03', model: 'deepseek-chat',
+    messages: [{ role: 'user', content: 'FAILCHAT 改后的问题' }],
+    editMessageId: firstUserId,
+  });
+  assert.match(sse, /"error"/, '上游失败应回 error 帧');
+
+  const after = await api('GET', `/api/chats/${cid}/messages`, { token: tokenA });
+  assert.equal(after.json.length, 4, '失败不得截断历史——尾部旧消息必须保留');
+  assert.equal(after.json[0].content, 'FAILCHAT 改后的问题', '编辑本身已生效');
+  assert.ok(after.json.some((m) => m.content === '第二问'), '原尾部用户消息仍在');
+});
+
+test('编辑重发：消息不存在或不属于本会话返回 404', async () => {
+  const sse = await api('POST', '/api/chat/stream', {
+    token: tokenA,
+    body: { chatId, requestId: 'req-edit-404', model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }], editMessageId: 'msg-not-exist' },
+  });
+  assert.equal(sse.status, 404);
+  assert.match(sse.json.error, /不存在/);
 });
 
 test('重新生成：携带标志且新回复成功后才删除旧回复', async () => {
