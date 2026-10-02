@@ -26,8 +26,9 @@ try {
   if (buf) {
     fs.writeFileSync(dest, buf);
   } else {
-    // 兜底：老版本 node:sqlite 无 serialize 时直接复制主库文件
-    fs.copyFileSync(src, dest);
+    // 老版本 node:sqlite 无 serialize：直接复制主库文件会漏掉 WAL 中未检查点的数据，
+    // 改用 VACUUM INTO 生成含 WAL 的一致快照（已在 Node 24 只读连接验证：含未落盘行）
+    db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
   }
   const size = fs.statSync(dest).size;
   console.log(`[backup] 已生成 ${dest}（${(size / 1024).toFixed(1)} KB）`);

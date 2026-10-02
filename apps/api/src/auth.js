@@ -44,7 +44,7 @@ export function publicUser(user) {
 export function auth(req, res, next) {
   let payload;
   try {
-    payload = jwt.verify(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''), secret);
+    payload = jwt.verify(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''), secret, { algorithms: ['HS256'] });
   } catch {
     return res.status(401).json({ error: '请先登录' });
   }

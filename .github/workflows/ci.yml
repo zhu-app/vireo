@@ -19,8 +19,8 @@ jobs:
       - name: 安装依赖（锁定 lockfile）
         run: npm ci --no-audit --no-fund
 
-      - name: 后端语法检查
-        run: node --check apps/api/src/index.js && node --check apps/api/src/gateway.js && node --check apps/api/src/auth.js && node --check apps/api/src/db.js && node --check apps/api/src/kb.js && node --check apps/api/src/search.js && node --check apps/api/src/ratelimit.js
+      - name: 后端语法检查（src 全量，新增文件自动纳入）
+        run: for f in apps/api/src/*.js; do node --check "$f"; done
 
       - name: 后端集成测试
         run: npm test -w @vireo/api

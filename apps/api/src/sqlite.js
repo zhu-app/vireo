@@ -38,6 +38,9 @@ export default class Database {
 
   transaction(fn) {
     return (...args) => {
+      // 嵌套事务：内层直接执行，由最外层统一 COMMIT/ROLLBACK
+      if (this._inTx) return fn(...args);
+      this._inTx = true;
       this._db.exec('BEGIN');
       try {
         const result = fn(...args);
@@ -48,6 +51,8 @@ export default class Database {
           this._db.exec('ROLLBACK');
         } catch {}
         throw error;
+      } finally {
+        this._inTx = false;
       }
     };
   }

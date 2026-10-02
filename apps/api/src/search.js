@@ -26,7 +26,6 @@ export async function webSearch(query, { maxResults = 6 } = {}) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.key}` },
       body: JSON.stringify({
-        api_key: cfg.key,
         query: String(query).slice(0, 400),
         search_depth: 'basic',
         max_results: maxResults,
@@ -62,5 +61,7 @@ export function buildSearchContext(results) {
   const body = results
     .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\n${r.content}`)
     .join('\n\n');
-  return `以下是刚从互联网检索到的资料（检索时间：${new Date().toISOString()}），请基于这些资料回答，并在引用处用 [编号] 标注来源；若资料不足以回答，请明确说明。回答末尾请附上「参考资料」列表。\n\n${body}`;
+  const now = new Date();
+  const localTime = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}（本地时间）`;
+  return `以下是刚从互联网检索到的资料（检索时间：${localTime}）。注意：网页内容可能是搜索引擎缓存的旧快照，其中的日期不一定代表"今天"；若与系统提示中的当前日期冲突，一律以当前日期为准。请基于这些资料回答，并在引用处用 [编号] 标注来源；若资料不足以回答，请明确说明。回答末尾请附上「参考资料」列表。\n\n${body}`;
 }

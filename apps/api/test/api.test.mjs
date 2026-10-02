@@ -293,9 +293,12 @@ test('登录限流：同一邮箱高频尝试返回 429', async () => {
 });
 
 // ---------- 上传 / 下载 ----------
-function multipart(files) {
+function multipart(files, extraFields = {}) {
   const boundary = '----vireoTestBoundary';
   const parts = [];
+  for (const [k, v] of Object.entries(extraFields)) {
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+  }
   for (const f of files) {
     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="${f.name}"\r\nContent-Type: ${f.type}\r\n\r\n`));
     parts.push(Buffer.from(f.data));
@@ -410,6 +413,71 @@ test('管理端：普通用户 403，管理员可读统计', async () => {
   const stats = await api('GET', '/api/admin/stats', { token: admin.json.token });
   assert.equal(stats.status, 200);
   assert.ok(stats.json.totals.users >= 3);
+});
+
+// ---------- 会话附件（方案二：只进当前对话，不进知识库） ----------
+let attChatId;
+let attFileId;
+
+test('附件上传：chatId 归属会话，知识库列表不含附件', async () => {
+  const c = await api('POST', '/api/chats', { token: tokenA, body: { title: '附件测试' } });
+  assert.equal(c.status, 201);
+  attChatId = c.json.id;
+  const mp = multipart([{ name: 'att-note.txt', type: 'text/plain', data: '附件里的秘密代号是紫罗兰。' }], { chatId: attChatId });
+  const r = await api('POST', '/api/files', { token: tokenA, body: mp.body, headers: mp.headers });
+  assert.equal(r.status, 201, `附件上传应成功：${r.text}`);
+  attFileId = r.json[0].id;
+  const kbList = await api('GET', '/api/files', { token: tokenA });
+  assert.ok(!kbList.json.some((f) => f.id === attFileId), '知识库列表不应包含会话附件');
+  const attList = await api('GET', `/api/chats/${attChatId}/attachments`, { token: tokenA });
+  assert.ok(attList.json.some((f) => f.id === attFileId), '附件接口应返回该文件');
+});
+
+test('附件上传：非法 chatId 拒绝', async () => {
+  const mp = multipart([{ name: 'bad.txt', type: 'text/plain', data: 'x'.repeat(8) }], { chatId: 'no-such-chat' });
+  const r = await api('POST', '/api/files', { token: tokenA, body: mp.body, headers: mp.headers });
+  assert.equal(r.status, 404);
+});
+
+test('附件检索注入：对话回答引用本会话附件（attachment notice）', async () => {
+  const ok = await waitFor(async () => {
+    const f = await api('GET', `/api/chats/${attChatId}/attachments`, { token: tokenA });
+    return f.json.find((x) => x.id === attFileId)?.status === 'ready';
+  });
+  assert.ok(ok, '附件应解析完成');
+  const sse = await streamOnce({ token: tokenA, chatId: attChatId, requestId: 'req-att-0001', model: 'deepseek-chat', messages: [{ role: 'user', content: '秘密代号是什么' }] });
+  assert.match(sse, /"type":"attachment"/);
+  assert.match(sse, /att-note\.txt/);
+});
+
+test('小附件全文直注：开放问题（无共同关键词）也引用附件', async () => {
+  const sse = await streamOnce({ token: tokenA, chatId: attChatId, requestId: 'req-att-0002', model: 'deepseek-chat', messages: [{ role: 'user', content: '这个文件大概讲了什么' }] });
+  assert.match(sse, /"type":"attachment"/);
+  assert.match(sse, /"via":"fulltext"/);
+  assert.match(sse, /att-note\.txt/);
+});
+
+test('可用状态的文件可重新解析（补语义向量）', async () => {
+  const r = await api('POST', `/api/files/${attFileId}/reindex`, { token: tokenA });
+  assert.equal(r.status, 200, `ready 文件应可重建：${r.text}`);
+  const ok = await waitFor(async () => {
+    const f = await api('GET', `/api/chats/${attChatId}/attachments`, { token: tokenA });
+    return f.json.find((x) => x.id === attFileId)?.status === 'ready';
+  });
+  assert.ok(ok, '重建后应回到 ready');
+  const { default: db } = await import('../src/db.js');
+  const withVec = db.prepare('SELECT COUNT(*) n FROM kb_chunks WHERE file_id = ? AND vec IS NOT NULL').get(attFileId).n;
+  assert.ok(withVec >= 1, '重建后应补齐向量');
+  const missing = await api('POST', '/api/files/no-such-file/reindex', { token: tokenA });
+  assert.equal(missing.status, 404);
+});
+
+test('删除会话：附件及其分块连带清理', async () => {
+  const del = await api('DELETE', `/api/chats/${attChatId}`, { token: tokenA });
+  assert.equal(del.status, 204);
+  const { default: db } = await import('../src/db.js');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM files WHERE id = ?').get(attFileId).n, 0, '附件行应删除');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM kb_chunks WHERE file_id = ?').get(attFileId).n, 0, '附件分块应删除');
 });
 
 test('cleanup', async () => {

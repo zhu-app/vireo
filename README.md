@@ -53,6 +53,7 @@ docker compose up -d --build
 
 - 数据（SQLite + 上传文件）持久化在 `vireo_data` 卷
 - Nginx 已为 SSE 关闭缓冲（`proxy_buffering off`），流式输出可直接透传
+- **真实客户端 IP**：应用层限流默认不信任 `X-Forwarded-For`（直连场景下可被伪造绕过）。`infra/docker-compose.yml` 已为本编排（API 固定位于 Nginx 反代之后）设置 `TRUST_PROXY=1`；自行换部署方式时，仅在确有反代时开启该项
 - **HTTPS**：默认配置只监听 80。对外提供服务请在 `deploy/nginx.conf` 底部模板启用 443 + 证书 + HSTS，并用 Let's Encrypt 等签发真实证书
 - **备份**：`node scripts/backup.mjs [输出目录]` 生成 SQLite 一致性快照，建议加入每日 cron；恢复 = 停机后用快照文件覆盖 `data/vireo.db`
 - **已内置的安全基线**：JWT 密钥缺失拒绝启动、登录/注册双层限流（应用层 + Nginx 层）、CSP 等安全响应头、上传类型白名单、知识库文件仅可经鉴权接口下载（无 `/uploads` 裸路径）

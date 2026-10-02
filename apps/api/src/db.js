@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS files (
   status TEXT NOT NULL DEFAULT 'pending',
   note TEXT,
   chunks INTEGER NOT NULL DEFAULT 0,
+  chat_id TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_files_user ON files(user_id, created_at DESC);
@@ -95,6 +96,7 @@ for (const ddl of [
   'ALTER TABLE kb_chunks ADD COLUMN vec BLOB',
   'ALTER TABLE kb_chunks ADD COLUMN vec_dim INTEGER',
   'ALTER TABLE kb_chunks ADD COLUMN embedding_model TEXT',
+  'ALTER TABLE files ADD COLUMN chat_id TEXT',
 ]) {
   try {
     db.exec(ddl);
@@ -113,10 +115,12 @@ const defaultSettings = {
 export function getSettings(userId) {
   let row = db.prepare('SELECT * FROM settings WHERE user_id = ?').get(userId);
   if (!row) {
-    row = { user_id: userId, ...defaultSettings, updated_at: Date.now() };
+    // 原子 upsert：并发首访同一用户不会撞 user_id 主键
     db.prepare(
-      'INSERT INTO settings (user_id, model, search_enabled, kb_ids, api_keys, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(row.user_id, row.model, row.search_enabled, row.kb_ids, row.api_keys, row.updated_at);
+      `INSERT INTO settings (user_id, model, search_enabled, kb_ids, api_keys, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING`
+    ).run(userId, defaultSettings.model, defaultSettings.search_enabled, defaultSettings.kb_ids, defaultSettings.api_keys, Date.now());
+    row = db.prepare('SELECT * FROM settings WHERE user_id = ?').get(userId);
   }
   return row;
 }

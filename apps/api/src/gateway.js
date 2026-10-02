@@ -51,11 +51,13 @@ export function getProviderMeta(provider) {
   return null;
 }
 
-/** 全部供应商（内置 + 自定义），供前端展示与分组 */
+/** 全部供应商（内置 + 自定义），供前端展示与分组；含 keySetting 供管理后台读取平台 Key */
 export function listProviders() {
-  const custom = Object.values(loadCustomProviders()).map((c) => ({ id: c.id, name: c.name, baseUrl: c.baseUrl, custom: true }));
-  const builtin = Object.entries(PROVIDER_DEFAULTS).map(([id, meta]) => ({ id, name: meta.name, baseUrl: meta.baseUrl, custom: false }));
-  return [...builtin, ...custom.sort((a, b) => a.name.localeCompare(b.name))];
+  const custom = Object.keys(loadCustomProviders())
+    .map((id) => getProviderMeta(id))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const builtin = Object.keys(PROVIDER_DEFAULTS).map((id) => getProviderMeta(id));
+  return [...builtin, ...custom];
 }
 
 function slugify(text) {
@@ -98,7 +100,16 @@ export function updateProvider(id, { name, baseUrl, key }) {
   }
   if (baseUrl !== undefined) {
     if (!/^https?:\/\/[^\s]+$/i.test(baseUrl)) throw new ProviderError('接口地址需以 http:// 或 https:// 开头');
-    map[id].baseUrl = String(baseUrl).trim().replace(/\/+$/, '');
+    const normalized = String(baseUrl).trim().replace(/\/+$/, '');
+    if (normalized !== map[id].baseUrl) {
+      // 地址变更：旧发现结果属于原上游，一并清理，需重新「获取模型列表」
+      map[id].baseUrl = normalized;
+      const dyn = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
+      if (dyn[id]) {
+        delete dyn[id];
+        setSettingValue(DYNAMIC_KEY, JSON.stringify(dyn));
+      }
+    }
   }
   if (key !== undefined) {
     const trimmed = String(key).trim();
@@ -166,7 +177,8 @@ function loadDynamicModels() {
         name: m.name && m.name !== m.id ? m.name : prettifyModelName(m.id),
         reasoning: Boolean(m.reasoning),
         vision: false,
-        desc: '上游发现',
+        desc: m.manual ? '手动添加' : '上游发现',
+        manual: Boolean(m.manual),
         dynamic: true,
       });
     }
@@ -215,7 +227,8 @@ export async function discoverModels(userId, provider) {
 
   const base = /\/v\d+$/.test(meta.baseUrl) ? meta.baseUrl : `${meta.baseUrl.replace(/\/$/, '')}/v1`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Number(process.env.UPSTREAM_TIMEOUT_MS || 30_000));
+  // 发现接口是秒级小响应，用独立超时；不要与流式对话共用的 UPSTREAM_TIMEOUT_MS 混用
+  const timer = setTimeout(() => controller.abort(), Number(process.env.DISCOVER_TIMEOUT_MS || 30_000));
   let upstream;
   try {
     upstream = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: controller.signal });
@@ -225,8 +238,10 @@ export async function discoverModels(userId, provider) {
     clearTimeout(timer);
   }
   if (!upstream.ok) {
-    const detail = (await upstream.text().catch(() => '')).slice(0, 200);
-    throw new GatewayError(`${meta.name} 模型列表接口返回错误（${upstream.status}）：${detail}`, 502);
+    const detail = (await upstream.text().catch(() => '')).slice(0, 300);
+    // 上游响应体可能含敏感信息：只进日志，用户侧只给状态码
+    console.error(`[gateway] ${meta.name} 模型列表错误（${upstream.status}）：${detail}`);
+    throw new GatewayError(`${meta.name} 模型列表接口返回错误（${upstream.status}），请检查接口地址与 API Key`, 502);
   }
   const json = await upstream.json().catch(() => null);
   const items = Array.isArray(json?.data) ? json.data : [];
@@ -240,9 +255,34 @@ export async function discoverModels(userId, provider) {
   if (!discovered.length) throw new GatewayError(`${meta.name} 未发现可对话的新模型（列表为空或均已存在）`, 502);
 
   const stored = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
-  stored[provider] = discovered.slice(0, 100); // 防异常响应撑爆设置表
+  // 整体替换时保留该供应商下手动添加且未被重复发现的模型
+  const prevManual = (Array.isArray(stored[provider]) ? stored[provider] : []).filter(
+    (m) => m?.manual && m?.id && !discovered.some((d) => d.id === m.id)
+  );
+  stored[provider] = [...prevManual, ...discovered].slice(0, 100); // 防异常响应撑爆设置表
   setSettingValue(DYNAMIC_KEY, JSON.stringify(stored));
   return discovered;
+}
+
+/**
+ * 手动添加模型：适用于不实现 GET /v1/models 列表接口的上游（如微信 Coding Plan），
+ * 直接写入与「获取模型列表」相同的 dynamic_models 存储，全平台共享。
+ */
+export function addManualModel(providerId, modelId) {
+  const meta = getProviderMeta(providerId);
+  if (!meta) throw new GatewayError(`不支持的供应商：${providerId}`, 400);
+  const id = String(modelId || '').trim();
+  if (!id || id.length > 60 || !/^[A-Za-z0-9._:[-]+$/.test(id)) {
+    throw new GatewayError('模型 ID 需为 1-60 个字符，仅允许字母、数字及 . _ : - 符号（请从平台页面原样复制，勿手打）', 400);
+  }
+  if (getModel(id)) throw new GatewayError(`模型「${id}」已存在，无需重复添加`, 400);
+
+  const stored = parseJsonSafe(settingValue(DYNAMIC_KEY), {});
+  const list = Array.isArray(stored[providerId]) ? stored[providerId] : [];
+  list.push({ id, name: prettifyModelName(id), reasoning: /(reason|r1|thinking)/i.test(id), manual: true, discovered_at: Date.now() });
+  stored[providerId] = list.slice(0, 100);
+  setSettingValue(DYNAMIC_KEY, JSON.stringify(stored));
+  return { id, name: prettifyModelName(id), provider: providerId, manual: true };
 }
 
 /** 删除某个动态模型（内置不可删） */
@@ -367,15 +407,18 @@ export async function streamChat({ userId, model, messages, signal, onDelta }) {
   if (!upstream.ok || !upstream.body) {
     cleanup();
     const text = await upstream.text().catch(() => '');
-    let detail = text.slice(0, 300);
+    // 上游响应体可能夹带 Key、内部地址等信息：只进服务端日志，不回显给用户
+    console.error(`[gateway] ${meta.name} 上游错误（${upstream.status}）：${text.slice(0, 300)}`);
+    let summary = '';
     try {
       const json = JSON.parse(text);
-      detail = json.error?.message || detail;
+      summary = String(json.error?.message || '');
     } catch {}
     const friendly =
       upstream.status === 401 ? `${meta.name} 拒绝了该 API Key，请检查是否有效` :
       upstream.status === 429 ? `${meta.name} 请求过于频繁或余额不足，请稍后再试` :
-      `${meta.name} 返回错误（${upstream.status}）：${detail}`;
+      summary ? `${meta.name} 返回错误（${upstream.status}）：${summary.slice(0, 120)}` :
+      `${meta.name} 返回错误（${upstream.status}），请稍后再试`;
     throw new GatewayError(friendly, 502);
   }
 

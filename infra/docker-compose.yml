@@ -10,6 +10,9 @@ services:
       JWT_SECRET: ${JWT_SECRET:?请在 infra/.env 中设置 JWT_SECRET}
       # 不再内置弱默认值：首次部署必须显式设置管理员密码，否则按缺失处理不落库
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?请在 infra/.env 中设置 DEFAULT_ADMIN_PASSWORD}
+      # 本编排中 API 始终位于 web 容器的 Nginx 反代之后，需信任 X-Forwarded-For，
+      # 否则应用层限流会把所有用户合并到 Nginx 容器 IP 这一个桶里。
+      TRUST_PROXY: "1"
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       SEARCH_API_KEY: ${SEARCH_API_KEY:-}

@@ -120,8 +120,9 @@ export async function ingestFile(fileRow) {
     const chunks = packChunks(splitParagraphs(raw));
     if (!chunks.length) throw new Error('未能从文件中提取到有效文本');
     const insert = db.prepare('INSERT INTO kb_chunks (file_id, user_id, idx, text, tokens, vec, vec_dim, embedding_model) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)');
-    db.prepare('DELETE FROM kb_chunks WHERE file_id = ?').run(fileRow.id);
+    // 删除与插入同一事务：中途失败自动回滚，旧分块不会被清空
     const tx = db.transaction(() => {
+      db.prepare('DELETE FROM kb_chunks WHERE file_id = ?').run(fileRow.id);
       chunks.forEach((c, i) => insert.run(fileRow.id, fileRow.user_id, i, c.text, c.tokens));
     });
     tx();

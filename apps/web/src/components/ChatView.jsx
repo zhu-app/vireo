@@ -7,6 +7,12 @@ function Notice({ notice }) {
   if (notice.type === 'kb') {
     return <div className="notice"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20V4H6.5A2.5 2.5 0 004 6.5v13z" /></svg>已参考知识库{notice.via === 'hybrid' ? '（语义+关键词）' : ''}：{notice.files.join('、')}（{notice.count} 个片段）</div>;
   }
+  if (notice.type === 'attachment') {
+    return <div className="notice"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.5l-8.5 8.5a5.4 5.4 0 01-7.6-7.6L13.5 4.9a3.6 3.6 0 015.1 5.1L10 18.9a1.8 1.8 0 01-2.5-2.5l7.8-7.8" /></svg>已参考本对话附件{notice.via === 'hybrid' ? '（语义+关键词）' : ''}：{notice.files.join('、')}（{notice.count} 个片段）</div>;
+  }
+  if (notice.type === 'attachment-error') {
+    return <div className="notice warn">⚠ 附件「{notice.files.join('、')}」解析失败，本次回答未引用其内容</div>;
+  }
   if (notice.type === 'search') {
     return (
       <div className="notice ok">
@@ -80,15 +86,33 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
   const inputRef = useRef(null);
   const fileRef = useRef(null);
 
+  const [attachments, setAttachments] = useState([]);
+  const [uploading, setUploading] = useState(false);
+
   const sendingRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
     setBusy(false);
+    setAttachments([]);
     api.messages(chat.id)
       .then((rows) => { if (!cancelled && !sendingRef.current) setMessages(rows); })
       .catch(() => {});
+    api.attachments(chat.id).then((rows) => { if (!cancelled) setAttachments(rows); }).catch(() => {});
     return () => { cancelled = true; streamRef.current?.stop(); };
   }, [chat.id]);
+
+  // 附件解析中：轮询刷新（与知识库页一致）
+  // cancelled 防护：1.5s 轮询窗口内切换会话时，旧请求的响应不得覆盖新会话的附件列表
+  useEffect(() => {
+    if (!attachments.some((f) => f.status === 'pending')) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      api.attachments(chat.id).then((rows) => { if (!cancelled) setAttachments(rows); }).catch(() => {});
+    }, 1500);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [attachments, chat.id]);
+
+  const refreshAttachments = () => api.attachments(chat.id).then(setAttachments).catch(() => {});
 
   useEffect(() => {
     const el = listRef.current;
@@ -203,15 +227,37 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
   async function onUpload(e) {
     const files = e.target.files;
     if (!files?.length) return;
+    setUploading(true);
     try {
-      await api.uploadFiles(files);
+      await api.uploadFiles(files, chat.id);
       e.target.value = '';
-      refreshStatus?.();
-      window.dispatchEvent(new Event('vireo:files-changed'));
+      await refreshAttachments();
+    } catch (err) {
+      setStreamError(err.message);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function removeAttachment(f) {
+    try {
+      await api.deleteFile(f.id);
+      await refreshAttachments();
     } catch (err) {
       setStreamError(err.message);
     }
   }
+
+  async function reparseAttachment(f) {
+    try {
+      await api.reindexFile(f.id);
+      await refreshAttachments();
+    } catch (err) {
+      setStreamError(err.message);
+    }
+  }
+
+  const ATT_STATUS = { pending: '解析中…', ready: '可用', failed: '解析失败', unsupported: '格式不支持' };
 
   function onKeyDown(e) {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -280,9 +326,26 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
         {modelOptions.length === 0 && (
           <div className="key-hint">尚未配置可用的模型 API Key —— <a href="#/settings" onClick={(e) => { e.preventDefault(); navigate('#/settings'); }}>去设置 →</a></div>
         )}
+        {attachments.length > 0 && (
+          <div className="att-strip">
+            <span className="att-label" title="附件只在这个对话里被引用，不会进知识库">本对话附件</span>
+            {attachments.map((f) => (
+              <span className={`att-chip ${f.status}`} key={f.id} title={f.status === 'ready' ? `${f.chunks} 个片段 · 仅本对话引用` : ATT_STATUS[f.status] || f.status}>
+                <i className="att-dot" />
+                <span className="att-name">{f.name}</span>
+                {f.status === 'pending' && <em className="att-status">解析中</em>}
+                {(f.status === 'failed' || f.status === 'unsupported') && <em className="att-status">不可用</em>}
+                {f.status !== 'unsupported' && (
+                  <button type="button" className="att-x" onClick={() => reparseAttachment(f)} title="重新解析（配置嵌入 Key 后可补语义向量）">↻</button>
+                )}
+                <button type="button" className="att-x" onClick={() => removeAttachment(f)} title="从本对话移除">×</button>
+              </span>
+            ))}
+          </div>
+        )}
         <form className="composer" onSubmit={(e) => { e.preventDefault(); send(); }}>
           <input ref={fileRef} type="file" multiple hidden onChange={onUpload} accept=".txt,.md,.markdown,.csv,.tsv,.json,.log,.xml,.yml,.yaml" />
-          <button type="button" className="icon-btn" onClick={() => fileRef.current.click()} title="上传文件到知识库">
+          <button type="button" className="icon-btn" onClick={() => fileRef.current.click()} disabled={uploading} title="上传附件（仅本对话引用，不进知识库）">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.5l-8.5 8.5a5.4 5.4 0 01-7.6-7.6L13.5 4.9a3.6 3.6 0 015.1 5.1L10 18.9a1.8 1.8 0 01-2.5-2.5l7.8-7.8" /></svg>
           </button>
           <textarea

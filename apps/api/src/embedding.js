@@ -74,8 +74,11 @@ export async function embedTexts(texts, userId) {
       const items = Array.isArray(json.data) ? json.data : [];
       if (items.length !== slice.length) throw new EmbedError('Embedding 返回数量与请求不一致');
       for (const item of items) {
+        const idx = Number(item.index);
         if (!Array.isArray(item.embedding) || !item.embedding.length) throw new EmbedError('Embedding 返回格式不正确');
-        out[start + item.index] = item.embedding;
+        if (!Number.isInteger(idx) || idx < 0 || idx >= slice.length) throw new EmbedError('Embedding 返回索引越界');
+        if (out[start + idx]) throw new EmbedError('Embedding 返回索引重复');
+        out[start + idx] = item.embedding;
       }
     } catch (error) {
       if (error instanceof EmbedError) throw error;

@@ -30,6 +30,7 @@ import {
   GatewayError,
   maskKey,
   discoverModels,
+  addManualModel,
   removeDynamicModel,
   listProviders,
   getProviderMeta,
@@ -41,7 +42,7 @@ import {
   PROVIDER_DEFAULTS,
 } from './gateway.js';
 import { isSupported, ingestFile, retrieveChunks, buildKbContext, deleteFileArtifacts } from './kb.js';
-import { webSearch, searchStatus, SearchError } from './search.js';
+import { webSearch, searchStatus, SearchError, buildSearchContext } from './search.js';
 import { embeddingStatus } from './embedding.js';
 import { rateLimit } from './ratelimit.js';
 
@@ -50,7 +51,10 @@ const port = Number(process.env.PORT || 8080);
 seedAdmin(hashPassword);
 migrateStaleModelRefs();
 
-app.set('trust proxy', 1); // Nginx 反代下取真实 IP，供限流与日志使用
+// 仅在明确部署于反代之后时开启：默认信任 X-Forwarded-For 会让直连方伪造头绕过按 IP 的限流
+if (['1', 'true'].includes(String(process.env.TRUST_PROXY || '').toLowerCase())) {
+  app.set('trust proxy', 1); // Nginx 反代下取真实 IP，供限流与日志使用
+}
 
 const corsOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -99,6 +103,7 @@ const Z = {
     apiKeys: z.record(z.string().min(1).max(40), z.string().max(200)).optional(),
   }),
   provider: z.object({ name: z.string().trim().min(1).max(40), baseUrl: z.string().trim().min(10).max(300), key: z.string().max(200).optional() }),
+  manualModel: z.object({ provider: z.string().trim().min(1).max(40), modelId: z.string().trim().min(1).max(60) }),
   providerUpdate: z.object({ name: z.string().trim().min(1).max(40).optional(), baseUrl: z.string().trim().min(10).max(300).optional(), key: z.string().max(200).optional() }),
   adminUser: z.object({ disabled: z.boolean().optional(), dailyLimit: z.number().int().min(0).max(1000000).optional(), name: z.string().trim().min(1).max(40).optional() }),
   adminKeys: z.record(z.string().min(1).max(40), z.string().max(200)).optional(),
@@ -221,6 +226,19 @@ api.post('/models/discover', auth, rateLimit({ windowMs: 60_000, max: 5, message
   }
 });
 
+// 手动添加模型：适用于不提供 /v1/models 列表接口的上游（如微信 Coding Plan），管理员操作，全平台共享
+api.post('/models/manual', auth, adminOnly, rateLimit({ windowMs: 60_000, max: 10, message: '添加模型过于频繁，请稍后再试' }), (req, res) => {
+  const body = validate(Z.manualModel, req.body || {}, res);
+  if (!body) return;
+  try {
+    res.status(201).json(addManualModel(body.provider, body.modelId));
+  } catch (error) {
+    if (error instanceof GatewayError) return res.status(error.status).json({ error: error.message });
+    console.error('[models/manual] unexpected error:', error?.message || error);
+    res.status(500).json({ error: '添加模型失败，请稍后再试' });
+  }
+});
+
 // 移除一个动态发现的模型（内置模型不可删）
 api.delete('/models/:id', auth, (req, res) => {
   const removed = removeDynamicModel(req.params.id);
@@ -291,13 +309,28 @@ api.delete('/chats/:id', auth, (req, res) => {
   if (!chat) return res.status(404).json({ error: '会话不存在' });
   db.prepare('DELETE FROM messages WHERE chat_id = ?').run(chat.id);
   db.prepare('DELETE FROM chats WHERE id = ?').run(chat.id);
+  // 会话附件随对话删除（不进知识库，离开本对话即无意义）
+  const attachments = db.prepare('SELECT * FROM files WHERE user_id = ? AND chat_id = ?').all(req.user.id, chat.id);
+  for (const f of attachments) deleteFileArtifacts(f);
+  db.prepare('DELETE FROM files WHERE user_id = ? AND chat_id = ?').run(req.user.id, chat.id);
   res.status(204).end();
 });
 
 // ---------- 文件 / 知识库 ----------
 const ALLOWED_EXT = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.log', '.xml', '.yml', '.yaml']);
+// 上传中途断连/异常可能让文件永久留在 tmp；每次启动先清空该目录回收残留
+const uploadTmpDir = path.join(dataDir, 'tmp');
+try {
+  if (fs.existsSync(uploadTmpDir)) {
+    for (const name of fs.readdirSync(uploadTmpDir)) {
+      try { fs.rmSync(path.join(uploadTmpDir, name), { force: true }); } catch {}
+    }
+  }
+} catch (error) {
+  console.warn('[upload] 启动清理 tmp 目录失败：', error?.message || error);
+}
 const upload = multer({
-  dest: path.join(dataDir, 'tmp'),
+  dest: uploadTmpDir,
   limits: { fileSize: 20 * 1024 * 1024, files: 8 },
   fileFilter(_, file, cb) {
     const name = Buffer.from(file.originalname, 'latin1').toString('utf8');
@@ -323,6 +356,20 @@ api.post('/files', auth, (req, res) => {
       return res.status(400).json({ error: message });
     }
   const rows = [];
+  // chatId 为空 → 知识库长期文件；有值且属于当前用户 → 会话级附件（只在该对话中被引用）
+  const rawChatId = String(req.body?.chatId || '').trim();
+  let attachedChatId = null;
+  if (rawChatId) {
+    const owner = db.prepare('SELECT id FROM chats WHERE id = ? AND user_id = ?').get(rawChatId, req.user.id);
+    if (!owner) {
+      // multer 的临时文件在 dataDir/tmp 下，直接按 f.path 清理
+      for (const f of req.files || []) {
+        try { fs.unlinkSync(f.path); } catch {}
+      }
+      return res.status(404).json({ error: '会话不存在，无法作为附件上传' });
+    }
+    attachedChatId = owner.id;
+  }
   for (const f of req.files || []) {
     const name = Buffer.from(f.originalname, 'latin1').toString('utf8') || f.filename;
     const finalName = `${req.user.id}-${f.filename}`;
@@ -341,7 +388,20 @@ api.post('/files', auth, (req, res) => {
       chunks: 0,
       created_at: Date.now(),
     };
-    db.prepare('INSERT INTO files (id, user_id, name, mime, size, path, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(row.id, row.user_id, row.name, row.mime, row.size, row.path, row.status, row.created_at);
+    try {
+      db.prepare('INSERT INTO files (id, user_id, name, mime, size, path, status, created_at, chat_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(row.id, row.user_id, row.name, row.mime, row.size, row.path, row.status, row.created_at, attachedChatId);
+    } catch (error) {
+      // 落库失败：回滚本轮已 rename 的文件与仍在 tmp 的剩余文件，避免残留占满磁盘
+      for (const done of rows) {
+        try { fs.unlinkSync(path.join(uploadDir, path.basename(done.path))); } catch {}
+      }
+      const remaining = [f, ...(req.files || []).slice((req.files || []).indexOf(f) + 1)];
+      for (const rest of remaining) {
+        try { if (fs.existsSync(rest.path)) fs.unlinkSync(rest.path); } catch {}
+      }
+      console.error('[upload] 落库失败，已回滚：', error?.message || error);
+      return res.status(500).json({ error: '上传失败，请重试' });
+    }
     rows.push(row);
   }
   res.status(201).json(rows.map(toFileDto));
@@ -360,7 +420,14 @@ function toFileDto(f) {
 }
 
 api.get('/files', auth, (req, res) => {
-  res.json(db.prepare('SELECT * FROM files WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id).map(toFileDto));
+  res.json(db.prepare('SELECT * FROM files WHERE user_id = ? AND chat_id IS NULL ORDER BY created_at DESC').all(req.user.id).map(toFileDto));
+});
+
+// 会话级附件：只属于当前对话，不进知识库列表
+api.get('/chats/:id/attachments', auth, (req, res) => {
+  const chat = db.prepare('SELECT id FROM chats WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!chat) return res.status(404).json({ error: '会话不存在' });
+  res.json(db.prepare('SELECT * FROM files WHERE user_id = ? AND chat_id = ? ORDER BY created_at DESC').all(req.user.id, chat.id).map(toFileDto));
 });
 
 api.delete('/files/:id', auth, (req, res) => {
@@ -375,8 +442,8 @@ api.delete('/files/:id', auth, (req, res) => {
 });
 
 api.post('/files/:id/reindex', auth, async (req, res) => {
-  const file = db.prepare("SELECT * FROM files WHERE id = ? AND user_id = ? AND status IN ('failed','pending')").get(req.params.id, req.user.id);
-  if (!file) return res.status(404).json({ error: '文件不存在或无需重建' });
+  const file = db.prepare("SELECT * FROM files WHERE id = ? AND user_id = ? AND status != 'unsupported'").get(req.params.id, req.user.id);
+  if (!file) return res.status(404).json({ error: '文件不存在或该格式无法解析重建' });
   db.prepare("UPDATE files SET status = 'pending', note = NULL WHERE id = ?").run(file.id);
   ingestFile(file)
     .then(() => {})
@@ -416,7 +483,11 @@ api.put('/settings', auth, (req, res) => {
     }
     patch.apiKeys = JSON.stringify(next);
   }
-  if (body.kbIds) patch.kbIds = JSON.stringify(body.kbIds);
+  if (Array.isArray(body.kbIds)) {
+    // 只保留确实属于当前用户的知识库文件，防止把他人 id 存进设置形成脏引用
+    const owned = new Set(db.prepare('SELECT id FROM files WHERE user_id = ? AND chat_id IS NULL').all(req.user.id).map((r) => r.id));
+    patch.kbIds = JSON.stringify(body.kbIds.filter((id) => owned.has(id)));
+  }
   if (typeof body.searchEnabled === 'boolean') patch.search_enabled = body.searchEnabled ? 1 : 0;
   const s = saveSettings(req.user.id, patch);
   res.json({ model: s.model, searchEnabled: Boolean(s.search_enabled), kbIds: parseJsonSafe(s.kb_ids, []) });
@@ -440,7 +511,8 @@ const activeStreams = new Map();
 
 api.post('/chat/stop', auth, (req, res) => {
   const requestId = String(req.body?.requestId || '');
-  const controller = activeStreams.get(requestId);
+  // 与 /chat/stream 同口径：键绑定用户，防止猜测他人 requestId 跨账号打断
+  const controller = activeStreams.get(`${req.user.id}:${requestId}`);
   if (controller) controller.abort();
   res.json({ stopped: Boolean(controller) });
 });
@@ -477,14 +549,17 @@ api.post('/chat/stream', auth, async (req, res) => {
   }
 
   const settings = getSettings(req.user.id);
-  const llmMessages = [{ role: 'system', content: '你是 Vireo，一个乐于助人的 AI 助手。请使用与用户提问相同的语言回答。Markdown 格式良好，代码用围栏标注语言。' }];
+  const now = new Date();
+  const weekday = ['日', '一', '二', '三', '四', '五', '六'][now.getDay()];
+  const todayStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日（星期${weekday}）`;
+  const llmMessages = [{ role: 'system', content: `你是 Vireo，一个乐于助人的 AI 助手。请使用与用户提问相同的语言回答。Markdown 格式良好，代码用围栏标注语言。\n当前日期（服务器本地时间）：${todayStr}。涉及"今天/现在/最近"等时间问题时以此为准；若网络搜索结果与此日期冲突，以当前日期为准并提醒用户结果可能来自缓存页面。` }];
 
   const notices = [];
 
   // 知识库检索注入
   const kbIds = parseJsonSafe(settings.kb_ids, []);
   if (kbIds.length && lastUser) {
-    const ready = db.prepare(`SELECT id FROM files WHERE id IN (${kbIds.map(() => '?').join(',')}) AND user_id = ? AND status = 'ready'`).all(...kbIds, req.user.id).map((r) => r.id);
+    const ready = db.prepare(`SELECT id FROM files WHERE id IN (${kbIds.map(() => '?').join(',')}) AND user_id = ? AND status = 'ready' AND chat_id IS NULL`).all(...kbIds, req.user.id).map((r) => r.id);
     if (ready.length) {
       const chunks = await retrieveChunks(req.user.id, lastUser.content, ready, 6);
       const context = buildKbContext(chunks);
@@ -495,17 +570,62 @@ api.post('/chat/stream', auth, async (req, res) => {
     }
   }
 
+  // 会话附件注入：小文件全文直注（总结类问题不依赖检索召回），大文件走分块检索；解析失败时明确告知
+  if (lastUser) {
+    const attRows = db.prepare("SELECT id, name, status, size FROM files WHERE user_id = ? AND chat_id = ? AND status != 'pending' ORDER BY created_at ASC").all(req.user.id, chat.id);
+    const failed = attRows.filter((f) => f.status === 'failed' || f.status === 'unsupported').map((f) => f.name);
+    if (failed.length) notices.push({ type: 'attachment-error', files: failed });
+    const readyFiles = attRows.filter((f) => f.status === 'ready');
+    const FULL_TEXT_LIMIT = 48 * 1024; // ≤48KB 的文本按全文注入
+    const totalSize = readyFiles.reduce((s, f) => s + (f.size || 0), 0);
+    if (readyFiles.length && totalSize <= FULL_TEXT_LIMIT) {
+      const parts = [];
+      let budget = 24_000; // 全部附件的注入预算（字符），超限的文件退回检索
+      const fallbackIds = [];
+      for (const f of readyFiles) {
+        const rows = db.prepare('SELECT text FROM kb_chunks WHERE file_id = ? ORDER BY idx ASC').all(f.id);
+        const text = rows.map((r) => r.text).join('\n');
+        if (text && budget >= text.length + f.name.length + 8) {
+          parts.push(`【${f.name}】\n${text}`);
+          budget -= text.length + f.name.length + 8;
+        } else if (f.id) {
+          fallbackIds.push(f.id);
+        }
+      }
+      if (parts.length) {
+        llmMessages.push({ role: 'system', content: `以下是用户上传到本对话的附件全文，请优先依据附件内容回答；提问涉及附件的任何部分（包括总结、"里面有什么"这类开放问题）都应引用附件。附件没有覆盖的可结合你自身知识，但要说明哪些来自附件。\n\n${parts.join('\n\n---\n\n')}` });
+        notices.push({ type: 'attachment', count: parts.length, via: 'fulltext', files: readyFiles.filter((f) => parts.some((p) => p.startsWith(`【${f.name}】`))).map((f) => f.name) });
+      }
+      const bigIds = readyFiles.map((f) => f.id).filter((id) => fallbackIds.includes(id));
+      if (bigIds.length) {
+        const chunks = await retrieveChunks(req.user.id, lastUser.content, bigIds, 8);
+        const context = buildKbContext(chunks);
+        if (context) {
+          llmMessages.push({ role: 'system', content: context });
+          notices.push({ type: 'attachment', count: chunks.length, via: chunks[0]?.via || 'keyword', files: [...new Set(chunks.map((c) => c.fileName))] });
+        }
+      }
+    } else if (readyFiles.length) {
+      const chunks = await retrieveChunks(req.user.id, lastUser.content, readyFiles.map((f) => f.id), 8);
+      const context = buildKbContext(chunks);
+      if (context) {
+        llmMessages.push({ role: 'system', content: context });
+        notices.push({ type: 'attachment', count: chunks.length, via: chunks[0]?.via || 'keyword', files: [...new Set(chunks.map((c) => c.fileName))] });
+      }
+    }
+  }
+
   // 联网搜索注入
   if (settings.search_enabled && lastUser) {
     if (searchStatus().configured) {
       try {
         const results = await webSearch(lastUser.content, { maxResults: 6 });
         if (results.length) {
-          llmMessages.push({
-            role: 'system',
-            content: `以下是关于用户问题的最新网络搜索结果，请优先参考并在回答末尾列出来源链接。\n\n${results.map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.content}`).join('\n\n')}`,
-          });
-          notices.push({ type: 'search', count: results.length, sources: results.slice(0, 6).map((r) => ({ title: r.title, url: r.url })) });
+          const context = buildSearchContext(results);
+          if (context) {
+            llmMessages.push({ role: 'system', content: context });
+            notices.push({ type: 'search', count: results.length, sources: results.slice(0, 6).map((r) => ({ title: r.title, url: r.url })) });
+          }
         }
       } catch (error) {
         notices.push({ type: 'search-error', message: error.message });
@@ -518,29 +638,69 @@ api.post('/chat/stream', auth, async (req, res) => {
   llmMessages.push(...history.map((m) => ({ role: m.role, content: m.content })));
 
   const controller = new AbortController();
-  activeStreams.set(body.requestId, controller);
+  // 键绑定用户：防止他人猜测 requestId 后跨账号打断别人的流
+  const streamKey = `${req.user.id}:${body.requestId}`;
+  activeStreams.set(streamKey, controller);
   // 注意：不能监听 req 的 close —— body 解析完后即触发，会误判为客户端断开
   res.on('close', () => {
     if (!res.writableEnded) controller.abort();
   });
 
-  writeSseHead(res);
-  res.write(`data: ${JSON.stringify({ meta: { notices } })}\n\n`);
-  // 心跳注释帧：让 Nginx 等中间层在有 Key 未配置、上游首包慢等静默期不切断连接
-  const heartbeat = setInterval(() => {
-    if (!res.writableEnded) res.write(': ping\n\n');
-  }, 15_000);
-  heartbeat.unref?.();
-
-  // 新回复落库；若是重新生成，成功后才移除旧回复
-  const persistAssistant = (content, reasoning) => {
-    const id = newId();
-    db.prepare('INSERT INTO messages (id, chat_id, role, content, reasoning, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, chat.id, 'assistant', content, reasoning || null, Date.now());
-    let deletedId = null;
-    if (priorAssistant && priorAssistant.id !== id) {
-      db.prepare('DELETE FROM messages WHERE id = ?').run(priorAssistant.id);
-      deletedId = priorAssistant.id;
+  // 安全写：客户端断连（关页面/反代超时）后 res.write 会抛错，统一吞掉并返回 false，
+  // 保证外层 try/finally 正常收尾（心跳清理、activeStreams 删除），进程不因写失败崩溃。
+  const safeWrite = (payload) => {
+    if (res.writableEnded || res.destroyed) return false;
+    try {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      return true;
+    } catch {
+      return false;
     }
+  };
+
+  // 声明在 try 外，保证 finally 一定能清理（writeSseHead 抛错时 heartbeat 仍为 null）
+  let heartbeat = null;
+  try {
+    writeSseHead(res);
+    safeWrite({ meta: { notices } });
+    // 心跳注释帧：让 Nginx 等中间层在有 Key 未配置、上游首包慢等静默期不切断连接；
+    // 写失败说明客户端已断开，顺带 abort 上游请求，避免无谓的流量与额度消耗。
+    heartbeat = setInterval(() => {
+      if (res.writableEnded || res.destroyed) {
+        controller.abort();
+        return;
+      }
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        controller.abort();
+      }
+    }, 15_000);
+    heartbeat.unref?.();
+  } catch (error) {
+    // 建连/写头阶段失败（客户端已断开等）：直接中止，不再无谓调用上游，走统一收尾
+    console.error('[chat/stream] SSE 建连失败：', error?.message || error);
+    controller.abort();
+  }
+
+  // 新回复落库 + 会话更新 + 用量记录：同一事务，避免「回复已入库但记账失败」导致额度统计不一致
+  const persistAssistant = (content, reasoning, usageStats) => {
+    const id = newId();
+    let deletedId = null;
+    db.transaction(() => {
+      db.prepare('INSERT INTO messages (id, chat_id, role, content, reasoning, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, chat.id, 'assistant', content, reasoning || null, Date.now());
+      if (priorAssistant && priorAssistant.id !== id) {
+        db.prepare('DELETE FROM messages WHERE id = ?').run(priorAssistant.id);
+        deletedId = priorAssistant.id;
+      }
+      db.prepare('UPDATE chats SET model = ?, updated_at = ? WHERE id = ?').run(model, Date.now(), chat.id);
+      // 首条消息自动取标题
+      if (chat.title === '新对话' && lastUser) {
+        const t = lastUser.content.replace(/\s+/g, ' ').slice(0, 24);
+        db.prepare('UPDATE chats SET title = ? WHERE id = ?').run(t || chat.title, chat.id);
+      }
+      recordUsage({ userId: req.user.id, chatId: chat.id, model, promptTokens: usageStats.promptTokens, completionTokens: usageStats.completionTokens, ok: true });
+    })();
     return { id, deletedId };
   };
 
@@ -551,39 +711,35 @@ api.post('/chat/stream', auth, async (req, res) => {
       model,
       messages: llmMessages,
       signal: controller.signal,
-      onDelta: (piece) => res.write(`data: ${JSON.stringify({ delta: piece })}\n\n`),
+      onDelta: (piece) => safeWrite({ delta: piece }),
     });
 
     if (result.aborted && !result.content.trim()) {
       // 用户一开始生成就停止：不落空回复，旧回复原样保留
       recordUsage({ userId: req.user.id, chatId: chat.id, model, promptTokens: result.promptTokens, completionTokens: 0, ok: true });
-      res.write(`data: ${JSON.stringify({ done: true, aborted: true, deletedMessageId: null })}\n\n`);
+      safeWrite({ done: true, aborted: true, deletedMessageId: null });
       finished = true;
     } else {
-      const saved = persistAssistant(result.content, result.reasoning);
-      db.prepare('UPDATE chats SET model = ?, updated_at = ? WHERE id = ?').run(model, Date.now(), chat.id);
-      // 首条消息自动取标题
-      if (chat.title === '新对话' && lastUser) {
-        const t = lastUser.content.replace(/\s+/g, ' ').slice(0, 24);
-        db.prepare('UPDATE chats SET title = ? WHERE id = ?').run(t || chat.title, chat.id);
-      }
-      recordUsage({ userId: req.user.id, chatId: chat.id, model, promptTokens: result.promptTokens, completionTokens: result.completionTokens, ok: true });
-      res.write(`data: ${JSON.stringify({ done: true, aborted: result.aborted, savedMessageId: saved.id, deletedMessageId: saved.deletedId, usage: { prompt: result.promptTokens, completion: result.completionTokens } })}\n\n`);
+      const saved = persistAssistant(result.content, result.reasoning, result);
+      safeWrite({ done: true, aborted: result.aborted, savedMessageId: saved.id, deletedMessageId: saved.deletedId, usage: { prompt: result.promptTokens, completion: result.completionTokens } });
       finished = true;
     }
   } catch (error) {
     const isAbort = error?.name === 'AbortError' || error?.message === '已停止生成';
     if (isAbort) {
-      res.write(`data: ${JSON.stringify({ done: true, aborted: true, deletedMessageId: null })}\n\n`);
+      safeWrite({ done: true, aborted: true, deletedMessageId: null });
       finished = true;
     } else {
+      // 回复尚未落库才记 ok:false，避免与事务内成功记账重复
       recordUsage({ userId: req.user.id, chatId: chat.id, model, promptTokens: 0, completionTokens: 0, ok: false });
-      res.write(`data: ${JSON.stringify({ error: error instanceof GatewayError ? error.message : '模型服务暂时不可用，请稍后再试', userMessageId: userMessage.id })}\n\n`);
+      safeWrite({ error: error instanceof GatewayError ? error.message : '模型服务暂时不可用，请稍后再试', userMessageId: userMessage.id });
     }
   } finally {
     clearInterval(heartbeat);
-    activeStreams.delete(body.requestId);
-    res.end();
+    activeStreams.delete(streamKey);
+    try {
+      res.end();
+    } catch {}
   }
 });
 
@@ -614,6 +770,25 @@ admin.patch('/users/:id', (req, res) => {
   if (typeof body.dailyLimit === 'number') db.prepare('UPDATE users SET daily_limit = ? WHERE id = ?').run(body.dailyLimit, user.id);
   if (body.name) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(body.name, user.id);
   res.json(publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(user.id)));
+});
+
+// 删除用户：连带清理其会话、消息、知识库（分块+原文件）、用量与设置。管理员账号不可删除。
+admin.delete('/users/:id', (req, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+  if (user.role === 'admin') return res.status(400).json({ error: '不能删除管理员账号' });
+  const fileRows = db.prepare('SELECT * FROM files WHERE user_id = ?').all(user.id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM messages WHERE chat_id IN (SELECT id FROM chats WHERE user_id = ?)').run(user.id);
+    db.prepare('DELETE FROM chats WHERE user_id = ?').run(user.id);
+    for (const f of fileRows) deleteFileArtifacts(f);
+    db.prepare('DELETE FROM kb_chunks WHERE user_id = ?').run(user.id);
+    db.prepare('DELETE FROM files WHERE user_id = ?').run(user.id);
+    db.prepare('DELETE FROM usage WHERE user_id = ?').run(user.id);
+    db.prepare('DELETE FROM settings WHERE user_id = ?').run(user.id);
+    db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
+  })();
+  res.json({ ok: true, deletedUser: publicUser(user) });
 });
 
 admin.get('/keys', (_, res) => {
@@ -659,7 +834,7 @@ admin.get('/stats', (_, res) => {
       messages: db.prepare('SELECT COUNT(*) n FROM messages').get().n,
       todayRequests: db.prepare('SELECT COUNT(*) n FROM usage WHERE created_at >= ? AND ok = 1').get(todayStart()).n,
       tokens7d: db.prepare('SELECT COALESCE(SUM(prompt_tokens + completion_tokens),0) t FROM usage WHERE created_at >= ?').get(since7).t,
-      files: db.prepare('SELECT COUNT(*) n FROM files').get().n,
+      files: db.prepare('SELECT COUNT(*) n FROM files WHERE chat_id IS NULL').get().n,
     },
     daily,
     byModel,
@@ -693,6 +868,14 @@ app.use((err, _req, res, _next) => {
   if (type === 'entity.parse.failed') return res.status(400).json({ error: '请求格式不正确' });
   console.error('[api] unhandled error:', err?.message || err);
   res.status(500).json({ error: '服务内部错误，请稍后再试' });
+});
+
+// ---------- 进程兜底：SSE/定时器残余异常只记录不上抛，避免整个 API 进程被一次写失败带崩 ----------
+process.on('unhandledRejection', (reason) => {
+  console.error('[api] unhandledRejection:', reason instanceof Error ? reason.message : reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('[api] uncaughtException:', error?.message || error);
 });
 
 // 导出 server：测试结束后关闭监听，避免进程无法退出；直接 `node src/index.js` 时行为不变
