@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS chats (
   user_id TEXT NOT NULL,
   title TEXT NOT NULL,
   model TEXT NOT NULL DEFAULT '',
+  system_prompt TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -99,6 +100,7 @@ for (const ddl of [
   'ALTER TABLE kb_chunks ADD COLUMN embedding_model TEXT',
   'ALTER TABLE files ADD COLUMN chat_id TEXT',
   'ALTER TABLE users ADD COLUMN pwd_changed_at INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE chats ADD COLUMN system_prompt TEXT NOT NULL DEFAULT \'\'',
 ]) {
   try {
     db.exec(ddl);

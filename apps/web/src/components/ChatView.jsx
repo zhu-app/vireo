@@ -268,6 +268,48 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
 
   const canSend = text.trim() && !busy && modelOptions.length > 0;
 
+  // ---- 对话级角色设定 ----
+  const [personaOpen, setPersonaOpen] = useState(false);
+  const [persona, setPersona] = useState(chat.systemPrompt || '');
+  const [personaSaving, setPersonaSaving] = useState(false);
+  useEffect(() => { setPersona(chat.systemPrompt || ''); }, [chat.id, chat.systemPrompt]);
+
+  async function savePersona() {
+    setPersonaSaving(true);
+    try {
+      const r = await api.updateChat(chat.id, { systemPrompt: persona.trim() });
+      setPersona(r.systemPrompt ?? persona.trim());
+      window.dispatchEvent(new Event('vireo:chats-changed')); // App 重新拉取会话，chat.systemPrompt 随 prop 更新
+      setPersonaOpen(false);
+    } catch (err) {
+      setStreamError(err.message);
+    } finally {
+      setPersonaSaving(false);
+    }
+  }
+
+  // ---- 导出会话为 Markdown（浏览器端拼好下载，无需后端） ----
+  function exportMarkdown() {
+    const done = messages.filter((m) => !m.error && m.content);
+    if (!done.length) { setStreamError('当前会话还没有可导出的内容'); return; }
+    const lines = [`# ${chat.title}`, ''];
+    if (chat.systemPrompt) lines.push(`> 角色设定：${chat.systemPrompt.replace(/\n/g, ' ')}`, '');
+    for (const m of done) {
+      lines.push(m.role === 'user' ? '## 用户' : '## 助手', '', m.content.trim(), '');
+    }
+    lines.push('---', '', `_导出时间：${new Date().toLocaleString('zh-CN')} · 共 ${done.length} 条消息_`, '');
+    const safeTitle = chat.title.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 60) || 'chat';
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeTitle}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <section className="chat-view">
       <header className="chat-head">
@@ -276,6 +318,14 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
         </button>
         <h2 className="chat-title" title={chat.title}>{chat.title}</h2>
         <div className="head-tools">
+          <button
+            className={`chip-btn persona-btn ${chat.systemPrompt ? 'on' : ''}`}
+            onClick={() => setPersonaOpen((v) => !v)}
+            title="为本对话设定角色 / 系统提示词（覆盖默认助手人设）"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2l2.4 6.9L21 11l-6.6 2.1L12 20l-2.4-6.9L3 11l6.6-2.1z" /></svg>
+            <span>角色</span>
+          </button>
           <label className="chip-toggle" title="开启后回答前会自动联网搜索">
             <input type="checkbox" checked={searchOn} onChange={async (e) => {
               setSearchOn(e.target.checked);
@@ -300,8 +350,37 @@ export default function ChatView({ chat, models, status, refreshStatus, onOpenHo
               </optgroup>
             ))}
           </select>
+          <button className="icon-btn" onClick={exportMarkdown} title="导出本会话为 Markdown 文件">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 3v12M7 10l5 5 5-5M4 19h16" /></svg>
+          </button>
         </div>
       </header>
+
+      {personaOpen && (
+        <div className="persona-panel">
+          <div className="persona-head">
+            <b>角色设定（本对话）</b>
+            <button className="ghost" onClick={() => setPersonaOpen(false)}>×</button>
+          </div>
+          <p className="muted">为这个对话指定 AI 的身份与回答风格，留空使用默认助手人设。仅影响本会话，下一条消息起生效。</p>
+          <textarea
+            rows={3}
+            maxLength={2000}
+            placeholder="例如：你是一位严格的代码审查专家，回答指出问题并给出修改建议，不需要客套话。"
+            value={persona}
+            onChange={(e) => setPersona(e.target.value)}
+          />
+          <div className="persona-actions">
+            <button className="btn primary sm" onClick={savePersona} disabled={personaSaving}>
+              {personaSaving ? '保存中…' : '保存设定'}
+            </button>
+            {persona && (
+              <button className="btn sm" onClick={() => setPersona('')} disabled={personaSaving}>清空</button>
+            )}
+            <span className="muted">{persona.length}/2000</span>
+          </div>
+        </div>
+      )}
 
       <div className="msg-list" ref={listRef}>
         {messages.length === 0 && (

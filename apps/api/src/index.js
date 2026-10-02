@@ -97,7 +97,8 @@ const passwordSchema = z
 const Z = {
   register: z.object({ name: z.string().trim().max(40).optional(), email: z.string().email('邮箱格式不正确'), password: passwordSchema }),
   login: z.object({ email: z.string().min(3), password: z.string().min(1) }),
-  chat: z.object({ title: z.string().trim().max(80).optional(), model: z.string().max(60).optional() }),
+  chat: z.object({ title: z.string().trim().max(80).optional(), model: z.string().max(60).optional(), systemPrompt: z.string().max(2000).optional() }),
+  chatUpdate: z.object({ title: z.string().trim().max(80).optional(), systemPrompt: z.string().max(2000).optional() }),
   stream: z
     .object({
       chatId: z.string(),
@@ -361,7 +362,7 @@ api.get('/chats', auth, (req, res) => {
     db
       .prepare('SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS messageCount FROM chats c WHERE c.user_id = ? ORDER BY c.updated_at DESC')
       .all(req.user.id)
-      .map((c) => ({ id: c.id, title: c.title, model: c.model, messageCount: c.messageCount, createdAt: c.created_at, updatedAt: c.updated_at }))
+      .map((c) => ({ id: c.id, title: c.title, model: c.model, systemPrompt: c.system_prompt || '', messageCount: c.messageCount, createdAt: c.created_at, updatedAt: c.updated_at }))
   );
 });
 
@@ -374,11 +375,12 @@ api.post('/chats', auth, (req, res) => {
     user_id: req.user.id,
     title: body.title?.trim() || '新对话',
     model: body.model || settings.model || '',
+    systemPrompt: body.systemPrompt?.trim() || '',
     created_at: Date.now(),
     updated_at: Date.now(),
   };
-  db.prepare('INSERT INTO chats (id, user_id, title, model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(chat.id, chat.user_id, chat.title, chat.model, chat.created_at, chat.updated_at);
-  res.status(201).json({ id: chat.id, title: chat.title, model: chat.model, messageCount: 0, createdAt: chat.created_at, updatedAt: chat.updated_at });
+  db.prepare('INSERT INTO chats (id, user_id, title, model, system_prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(chat.id, chat.user_id, chat.title, chat.model, chat.systemPrompt, chat.created_at, chat.updated_at);
+  res.status(201).json({ id: chat.id, title: chat.title, model: chat.model, systemPrompt: chat.systemPrompt, messageCount: 0, createdAt: chat.created_at, updatedAt: chat.updated_at });
 });
 
 api.get('/chats/:id/messages', auth, (req, res) => {
@@ -395,9 +397,14 @@ api.get('/chats/:id/messages', auth, (req, res) => {
 api.patch('/chats/:id', auth, (req, res) => {
   const chat = db.prepare('SELECT * FROM chats WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
   if (!chat) return res.status(404).json({ error: '会话不存在' });
-  const title = z.string().trim().min(1).max(80).safeParse(req.body?.title);
-  if (title.success) db.prepare('UPDATE chats SET title = ?, updated_at = ? WHERE id = ?').run(title.data, Date.now(), chat.id);
-  res.json({ id: chat.id, title: title.success ? title.data : chat.title });
+  const body = validate(Z.chatUpdate, req.body || {}, res);
+  if (!body) return;
+  const patch = { ...chat };
+  if (body.title !== undefined && body.title.trim()) patch.title = body.title.trim();
+  // systemPrompt 允许传空串显式清空；未传字段保持原值
+  if (body.systemPrompt !== undefined) patch.system_prompt = body.systemPrompt.trim();
+  db.prepare('UPDATE chats SET title = ?, system_prompt = ?, updated_at = ? WHERE id = ?').run(patch.title, patch.system_prompt, Date.now(), chat.id);
+  res.json({ id: chat.id, title: patch.title, systemPrompt: patch.system_prompt });
 });
 
 api.delete('/chats/:id', auth, (req, res) => {
@@ -627,6 +634,18 @@ api.post('/chat/stream', auth, async (req, res) => {
     return res.status(429).json({ error: `今日消息额度已用完（${quota.used}/${quota.limit} 条）。明天恢复，或联系管理员调整额度。` });
   }
 
+  // 并发防护：额度是流结束才记账的，若不限并发，用户可在记账前同时发起多路流绕过日额度，
+  // 或用挂住的 SSE 连接耗尽内存与上游配额。按用户限制同时进行中的流数量（默认 3，可配）。
+  const streamKey = `${req.user.id}:${body.requestId}`;
+  const CONCURRENT_MAX = Number(process.env.CONCURRENT_STREAM_MAX || 3);
+  if (!activeStreams.has(streamKey)) {
+    let userActive = 0;
+    for (const k of activeStreams.keys()) if (k.startsWith(`${req.user.id}:`)) userActive += 1;
+    if (userActive >= CONCURRENT_MAX) {
+      return res.status(429).json({ error: `同时进行中的对话已达上限（${CONCURRENT_MAX} 路），请等待其他回复完成或停止后再发送。` });
+    }
+  }
+
   const history = body.messages.filter((m) => m.role !== 'system');
   const lastUser = [...history].reverse().find((m) => m.role === 'user');
 
@@ -648,7 +667,12 @@ api.post('/chat/stream', auth, async (req, res) => {
   const now = new Date();
   const weekday = ['日', '一', '二', '三', '四', '五', '六'][now.getDay()];
   const todayStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日（星期${weekday}）`;
-  const llmMessages = [{ role: 'system', content: `你是 Vireo，一个乐于助人的 AI 助手。请使用与用户提问相同的语言回答。Markdown 格式良好，代码用围栏标注语言。\n当前日期（服务器本地时间）：${todayStr}。涉及"今天/现在/最近"等时间问题时以此为准；若网络搜索结果与此日期冲突，以当前日期为准并提醒用户结果可能来自缓存页面。` }];
+  // 会话设置了角色设定时用它替代默认人设（更贴合用户意图）；两种情况都追加日期锚点，
+  // 保证"今天/最近"类问题不因设定文本而丢失时间基准。
+  const persona = (chat.system_prompt || '').trim()
+    || '你是 Vireo，一个乐于助人的 AI 助手。请使用与用户提问相同的语言回答。Markdown 格式良好，代码用围栏标注语言。';
+  const dateNote = `当前日期（服务器本地时间）：${todayStr}。涉及"今天/现在/最近"等时间问题时以此为准；若网络搜索结果与此日期冲突，以当前日期为准并提醒用户结果可能来自缓存页面。`;
+  const llmMessages = [{ role: 'system', content: `${persona}\n${dateNote}` }];
 
   const notices = [];
 
@@ -734,8 +758,10 @@ api.post('/chat/stream', auth, async (req, res) => {
   llmMessages.push(...history.map((m) => ({ role: m.role, content: m.content })));
 
   const controller = new AbortController();
-  // 键绑定用户：防止他人猜测 requestId 后跨账号打断别人的流
-  const streamKey = `${req.user.id}:${body.requestId}`;
+  // streamKey 已在入口处定义（含并发检查）。同 requestId 重入（重复点击）：先 abort 旧流，
+  // 否则旧流条目的 finally 会把新流刚 set 的项删掉，导致相互干扰。
+  const prevStream = activeStreams.get(streamKey);
+  if (prevStream) prevStream.abort();
   activeStreams.set(streamKey, controller);
   // 注意：不能监听 req 的 close —— body 解析完后即触发，会误判为客户端断开
   res.on('close', () => {

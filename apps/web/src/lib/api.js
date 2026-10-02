@@ -71,6 +71,7 @@ export const api = {
   createChat: (body = {}) => request('/api/chats', { method: 'POST', body: JSON.stringify(body) }),
   messages: (chatId) => request(`/api/chats/${chatId}/messages`),
   renameChat: (chatId, title) => request(`/api/chats/${chatId}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+  updateChat: (chatId, body) => request(`/api/chats/${encodeURIComponent(chatId)}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteChat: (chatId) => request(`/api/chats/${chatId}`, { method: 'DELETE' }),
   files: () => request('/api/files'),
   uploadFiles: (fileList, chatId) => {

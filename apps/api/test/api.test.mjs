@@ -63,6 +63,24 @@ const mockServer = http.createServer((req, res) => {
       res.writeHead(404);
       return res.end();
     }
+    // 并发测试专用：请求里带 SLOWTEST 标记时，每 300ms 推一个分片、共约 6s，
+    // 制造"长时间进行中"的流；客户端断开（stop）即停表，不向已关闭连接写入。
+    if (raw.includes('SLOWTEST')) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      let n = 0;
+      const iv = setInterval(() => {
+        n += 1;
+        if (n >= 20) {
+          clearInterval(iv);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '慢' } }] })}\n\n`);
+      }, 300);
+      res.on('close', () => clearInterval(iv));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '你好' } }] })}\n\n`);
     res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '，Vireo' } }] })}\n\n`);
@@ -595,6 +613,76 @@ test('重启自愈：pending 僵尸文件被重新解析为 ready 或 unsupporte
   // 场景 A 走异步 ingestFile，轮询等待其解析完成
   const ready = await waitFor(async () => dbCore.prepare('SELECT status FROM files WHERE id = ?').get(okId).status === 'ready');
   assert.ok(ready, '受支持的 pending 文件应被自愈解析为 ready');
+});
+
+// ---------- 并发防护 与 对话级 system prompt ----------
+test('并发防护：超过 CONCURRENT_STREAM_MAX 的进行中流被拒 429', async () => {
+  process.env.CONCURRENT_STREAM_MAX = '2'; // handler 每次请求实时读取，测试内可调
+  const created = await api('POST', '/api/chats', { token: tokenA, body: { title: '并发测试' } });
+  assert.equal(created.status, 201);
+  const cid = created.json.id;
+
+  const slowStream = async (rid, text) => {
+    const res = await fetch(`${BASE}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
+      body: JSON.stringify({ chatId: cid, requestId: rid, model: 'deepseek-chat', messages: [{ role: 'user', content: text }] }),
+    });
+    return res;
+  };
+
+  // 先占满 2 路：读到首帧才算真正进入"进行中"集合，避免与异步准备段竞态
+  const s1 = await slowStream('req-conc-1', 'SLOWTEST one');
+  assert.equal(s1.status, 200);
+  await s1.body.getReader().read();
+  const s2 = await slowStream('req-conc-2', 'SLOWTEST two');
+  assert.equal(s2.status, 200);
+  await s2.body.getReader().read();
+
+  const third = await slowStream('req-conc-3', 'SLOWTEST three');
+  assert.equal(third.status, 429, '第 3 路并发应被拒绝');
+  const err = await third.json();
+  assert.match(err.error, /上限/);
+
+  // 释放两路后应恢复可用
+  await api('POST', '/api/chat/stop', { token: tokenA, body: { requestId: 'req-conc-1' } });
+  await api('POST', '/api/chat/stop', { token: tokenA, body: { requestId: 'req-conc-2' } });
+  const freed = await waitFor(async () => {
+    const r = await slowStream(`req-conc-4-${Date.now()}`, '并发释放验证');
+    if (r.status === 200) { await r.text(); return true; }
+    await r.text();
+    return false;
+  });
+  assert.ok(freed, 'stop 释放槽位后新流应可发起');
+  delete process.env.CONCURRENT_STREAM_MAX;
+});
+
+test('对话级 system prompt：会话设定进入消息且落库回读', async () => {
+  const created = await api('POST', '/api/chats', { token: tokenA, body: { title: '设定会话', systemPrompt: '你是 piratespeak，每句带 arr' } });
+  assert.equal(created.status, 201);
+  assert.equal(created.json.systemPrompt, '你是 piratespeak，每句带 arr');
+
+  const patch = await api('PATCH', `/api/chats/${created.json.id}`, { token: tokenA, body: { systemPrompt: '改后的设定' } });
+  assert.equal(patch.status, 200);
+  assert.equal(patch.json.systemPrompt, '改后的设定');
+
+  const list = await api('GET', '/api/chats', { token: tokenA });
+  const row = list.json.find((c) => c.id === created.json.id);
+  assert.equal(row.systemPrompt, '改后的设定', '列表应回带设定');
+
+  // 空串显式清空
+  const clear = await api('PATCH', `/api/chats/${created.json.id}`, { token: tokenA, body: { systemPrompt: '' } });
+  assert.equal(clear.json.systemPrompt, '');
+
+  // 超长设定被拒绝
+  const tooLong = await api('POST', '/api/chats', { token: tokenA, body: { title: 'x', systemPrompt: 'a'.repeat(2001) } });
+  assert.equal(tooLong.status, 400);
+
+  // 带设定发消息：正常完成（mock 不感知设定，验证链路与落库不受影响）
+  const sse = await streamOnce({ token: tokenA, chatId: created.json.id, requestId: 'req-sp-01', model: 'deepseek-chat', messages: [{ role: 'user', content: '喂' }] });
+  assert.match(sse, /"done":true/);
+  const msgs = await api('GET', `/api/chats/${created.json.id}/messages`, { token: tokenA });
+  assert.equal(msgs.json.at(-1).role, 'assistant');
 });
 
 test('cleanup', async () => {

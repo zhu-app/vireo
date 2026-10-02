@@ -305,6 +305,22 @@ a:hover { text-decoration: underline; }
 .chip-toggle:has(input:checked) { background: var(--accent-soft); color: var(--brand-1); border-color: transparent; font-weight: 600; }
 .model-select { font-size: 13px; padding: 6px 8px; border-radius: 99px; max-width: 170px; }
 
+/* 角色设定：头部按钮 + 展开面板 */
+.chip-btn { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-2);
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 99px;
+  padding: 5px 12px; cursor: pointer; user-select: none; }
+.chip-btn:hover { color: var(--brand-1); }
+.chip-btn.on { background: var(--accent-soft); color: var(--brand-1); border-color: transparent; font-weight: 600; }
+.persona-panel { padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--bg-sunken);
+  display: flex; flex-direction: column; gap: 8px; }
+.persona-panel textarea { width: 100%; resize: vertical; font: inherit; font-size: 13.5px;
+  padding: 8px 10px; border-radius: var(--radius-s); border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); }
+.persona-head { display: flex; align-items: center; justify-content: space-between; }
+.persona-head b { font-size: 13.5px; }
+.persona-actions { display: flex; align-items: center; gap: 10px; }
+.persona-actions .muted { font-size: 12px; margin-left: auto; }
+
 .msg-list { flex: 1; overflow-y: auto; padding: 26px 0 16px; scroll-behavior: smooth; }
 .chat-hint {
   height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
